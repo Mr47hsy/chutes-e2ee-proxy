@@ -5,7 +5,8 @@
 -- sends through the E2EE pipeline, and translates responses back.
 --
 
-local cjson = require("cjson.safe")
+local cjson = require("cjson.safe").new()
+cjson.decode_array_with_array_mt(true)
 local e2ee = require("e2ee_handler")
 local resp_fmt = require("responses_format")
 

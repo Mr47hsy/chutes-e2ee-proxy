@@ -10,6 +10,8 @@ local base64 = require("ngx.base64") or {
     encode_base64 = ngx.encode_base64,
     decode_base64 = ngx.decode_base64,
 }
+local cjson = require("cjson").new()
+cjson.decode_array_with_array_mt(true)
 
 ffi.cdef[[
     int e2ee_init(void);
@@ -211,7 +213,6 @@ function _M.build_e2ee_request(e2e_pubkey_b64, payload_json)
     if not sym_key then return nil, nil, err end
 
     -- 5. Augment payload with response public key
-    local cjson = require("cjson")
     local payload = cjson.decode(payload_json)
     payload["e2e_response_pk"] = ngx.encode_base64(ffi.string(response_pk, 1184))
     local augmented_json = cjson.encode(payload)
