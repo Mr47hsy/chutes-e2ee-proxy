@@ -45,9 +45,15 @@ MLKEM_PK = 1184
 NONCE_TTL = 55
 
 CHUTE_TEE = str(uuid.uuid5(uuid.NAMESPACE_DNS, "tee"))
+CHUTE_TEE_B = str(uuid.uuid5(uuid.NAMESPACE_DNS, "tee-b"))
+CHUTE_TEE_C = str(uuid.uuid5(uuid.NAMESPACE_DNS, "tee-c"))
 CHUTE_PLAIN = str(uuid.uuid5(uuid.NAMESPACE_DNS, "plain"))
 MODELS = [
     {"id": "mock/TEE-model", "chute_id": CHUTE_TEE, "confidential_compute": True},
+    # Second TEE model: routing tests use it to get fresh per-chute proxy state
+    # (ring / stickiness / nonce batch) independent of the other tests.
+    {"id": "mock/TEE-model-b", "chute_id": CHUTE_TEE_B, "confidential_compute": True},
+    {"id": "mock/TEE-model-c", "chute_id": CHUTE_TEE_C, "confidential_compute": True},
     {"id": "mock/plain-model", "chute_id": CHUTE_PLAIN, "confidential_compute": False},
 ]
 
@@ -171,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._auth_ok():
                     return self._json(401, {"detail": "unauthorized"})
                 chute = parts[2]
-                if chute not in (CHUTE_TEE, CHUTE_PLAIN):
+                if chute not in (CHUTE_TEE, CHUTE_TEE_B, CHUTE_TEE_C, CHUTE_PLAIN):
                     return self._json(404, {"detail": "chute not found"})
                 insts = []
                 for inst in STATE.instances.values():
@@ -300,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
                 "usage": usage,
             }
-            ct2, ss2 = ML_KEM_768.encaps(resp_pk)
+            ss2, ct2 = ML_KEM_768.encaps(resp_pk)  # kyber-py returns (K, c)
             key2 = hkdf(ss2, ct2[:16], b"e2e-resp-v1")
             n2 = secrets.token_bytes(12)
             sealed = ChaCha20Poly1305(key2).encrypt(n2, gzip.compress(json.dumps(completion).encode()), None)
@@ -309,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
         # ---- streaming: e2e_init + encrypted chunks + [DONE] ----------------
         with STATE.lock:
             STATE.stats["stream"] += 1
-        ct2, ss2 = ML_KEM_768.encaps(resp_pk)
+        ss2, ct2 = ML_KEM_768.encaps(resp_pk)  # kyber-py returns (K, c)
         skey = hkdf(ss2, ct2[:16], b"e2e-stream-v1")
         aead = ChaCha20Poly1305(skey)
 

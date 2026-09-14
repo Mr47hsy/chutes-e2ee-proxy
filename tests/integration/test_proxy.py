@@ -24,6 +24,8 @@ PROXY_SMALL = os.environ.get("PROXY_SMALL_BODY_URL", "").rstrip("/")
 MOCK = os.environ.get("MOCK_URL", "http://127.0.0.1:9100").rstrip("/")
 KEY = "cpk_integration_test_key"
 MODEL = "mock/TEE-model"
+MODEL_B = "mock/TEE-model-b"  # separate chutes -> fresh routing state in the proxy
+MODEL_C = "mock/TEE-model-c"
 HDRS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 
@@ -189,10 +191,10 @@ def test_404_json():
 # routing modes
 # ---------------------------------------------------------------------------
 
-def instances_used(c, n, mode, content="affinity"):
+def instances_used(c, n, mode, content="affinity", model=MODEL):
     used = []
     for i in range(n):
-        r = chat(c, f"{content} {i}", mode=mode)
+        r = chat(c, f"{content} {i}", mode=mode, model=model)
         assert r.status_code == 200, r.text
         used.append(r.headers["X-E2EE-Instance-Id"])
     return used
@@ -205,11 +207,39 @@ def test_agent_mode_sticks_to_one_instance():
 
 
 def test_balanced_mode_rotates_over_three():
+    # Uses MODEL_B: the proxy keeps routing state per chute, and earlier tests
+    # on MODEL may have exhausted one instance's 10-nonce batch (an exhausted
+    # ring member is skipped, not evicted), which would break strict rotation.
     with client() as c:
-        used = instances_used(c, 9, "balanced")
+        used = instances_used(c, 9, "balanced", model=MODEL_B)
     assert len(set(used)) == 3, used
     # strict round robin over the same three
     assert used[0:3] == used[3:6] == used[6:9], used
+
+
+def test_balanced_mode_skips_exhausted_member_without_evicting():
+    # Fresh chute (MODEL_C): 5 instances x 10 nonces per batch.
+    #   3 balanced picks -> ring = 3 members, 9 nonces left each
+    #   9 agent picks    -> agent sticks to the ring member with the lowest
+    #                       TTFT EWMA and drains exactly its 9 remaining nonces
+    #   6 balanced picks -> must alternate over the other two members, with no
+    #                       nonce refresh and no fourth instance pulled in
+    with client() as c:
+        ring = instances_used(c, 3, "balanced", model=MODEL_C)
+        assert len(set(ring)) == 3
+        sticky = chat(c, mode="agent", model=MODEL_C).headers["X-E2EE-Instance-Id"]
+        assert sticky in ring, "agent picks a warm ring member over cold instances"
+        for _ in range(8):
+            r = chat(c, mode="agent", model=MODEL_C)
+            assert r.status_code == 200
+            assert r.headers["X-E2EE-Instance-Id"] == sticky
+        fetches_before = mock_stats()["instances_calls"]
+        used = instances_used(c, 6, "balanced", model=MODEL_C)
+        fetches_after = mock_stats()["instances_calls"]
+    assert set(used) <= set(ring), (used, ring)
+    assert sticky not in used, "exhausted member must be skipped until nonces refresh"
+    assert len(set(used)) == 2 and used[0:2] == used[2:4] == used[4:6], used
+    assert fetches_after == fetches_before, "no nonce refresh while other members still have nonces"
 
 
 def test_performance_and_default_modes_serve_requests():

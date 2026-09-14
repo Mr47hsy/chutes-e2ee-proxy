@@ -93,7 +93,14 @@ curl -sk https://localhost:8443/v1/chat/completions \
   described in [`native/mlkem/README.md`](native/mlkem/README.md).
 
 Then run a streaming request as well (`"stream": true`); it exercises the
-separate `e2e-stream-v1` key derivation.
+separate `e2e-stream-v1` key derivation. `tests/e2e_real.sh` does all of the
+above (health, model listing, non-streaming, streaming, metrics) and reads the
+key from `CHUTES_API_KEY` without echoing it:
+
+```bash
+docker run -d --name e2ee-proxy -p 8443:443 e2ee-proxy
+CHUTES_API_KEY=cpk_... tests/e2e_real.sh
+```
 
 ## TLS
 
@@ -300,14 +307,13 @@ cd native && ./build.sh --selftest         # needs a C compiler, OpenSSL headers
 tests/unit/run.sh                          # needs luajit
 ```
 
-Integration tests need the built image and a Python environment:
+Integration tests need the built image and a Python environment; the runner
+starts the mock upstream and three proxy containers (observe / enforce /
+1 MB body limit), runs pytest and scans the proxy logs for key material:
 
 ```bash
-pip install -r tests/integration/requirements.txt
-python3 tests/integration/mock_upstream.py --port 9100 &
-docker run -d -p 8443:443 --add-host=host.docker.internal:host-gateway \
-  -e API_BASE=http://host.docker.internal:9100 -e MODELS_BASE=http://host.docker.internal:9100 e2ee-proxy
-pytest -q tests/integration/test_proxy.py
+python3 -m venv .venv && .venv/bin/pip install -r tests/integration/requirements.txt
+PYTHON=.venv/bin/python tests/integration/run_local.sh        # add --keep to leave containers up
 ```
 
 CI (`.github/workflows/ci.yml`) runs LuaJIT syntax checks, luacheck, unit
