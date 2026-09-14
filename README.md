@@ -37,13 +37,16 @@ Client (OpenAI SDK / Anthropic SDK / curl)
 
 ## Quick start
 
+Pull a released image from GitHub Container Registry, or build locally:
+
 ```bash
-# build (linux/amd64 by default, Debian bookworm base)
+# released image (published on release-* tags, see "Releases" below)
+docker run --rm -p 8443:443 ghcr.io/mr47hsy/chutes-e2ee-proxy:latest
+
+# or build yourself (linux/amd64 by default, Debian bookworm base)
 ./build.sh                      # -> image e2ee-proxy
 ./build.sh --alpine             # same layout on Alpine (musl)
-
-# run: self-signed TLS, balanced routing, attestation enforced
-docker run --rm -p 8443:443 e2ee-proxy
+docker run --rm -p 8443:443 e2ee-proxy   # self-signed TLS, balanced routing, attestation enforced
 ```
 
 The container prints how to trust its self-signed certificate. The certificate
@@ -339,6 +342,27 @@ tests, the native self-test, builds the amd64 image, runs the in-image cjson
 round-trip test, and drives three proxy containers (observe, enforce, small
 body limit) against the mock upstream, then asserts that no API key material
 appears in the logs.
+
+### Releases
+
+Images are published to `ghcr.io/<owner>/chutes-e2ee-proxy` by
+`.github/workflows/publish.yml` whenever a `release-*` tag is pushed:
+
+```bash
+git tag release-1.0.0
+git push origin release-1.0.0
+```
+
+The workflow re-runs lint, unit and native tests, builds both variants, runs
+the integration suite against the freshly built image, and only then pushes:
+
+| Tag pushed | Image tags |
+|---|---|
+| `release-1.0.0` | `1.0.0`, `latest`, `sha-<short>` (Debian); `1.0.0-alpine`, `latest-alpine` (Alpine) |
+
+The first publish creates a private package under the repository owner; make
+it public in the package settings if anonymous `docker pull` is wanted. The
+images are `linux/amd64`.
 
 ### Image notes
 
