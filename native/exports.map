@@ -1,6 +1,7 @@
 {
   global:
     e2ee_init;
+    e2ee_build_info;
     e2ee_get_cert_der;
     e2ee_get_intermediate_der;
     e2ee_get_root_der;
