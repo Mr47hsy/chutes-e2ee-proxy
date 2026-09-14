@@ -1,46 +1,66 @@
 --
--- e2ee_handler.lua - Main nginx request handler
+-- e2ee_handler.lua - main request handler and the shared E2EE round trip.
 --
--- Transparently intercepts OpenAI-compatible requests, encrypts them
--- using the E2EE protocol, sends to api.chutes.ai, and decrypts responses.
+-- Transparently intercepts OpenAI-compatible requests, encrypts them with
+-- the E2EE protocol, sends them to api.chutes.ai, and decrypts responses
+-- (JSON or SSE). claude_handler / responses_handler reuse e2ee_round_trip().
 --
--- Handles both streaming (SSE) and non-streaming responses.
--- Exposes reusable core functions for other format handlers.
+-- Per request:
+--   1. resolve model -> chute_id
+--   2. pick instance + nonce (instance_selector via discovery, honouring
+--      X-Route-Mode / ROUTE_MODE), attest its public key
+--   3. encrypt, POST /e2e/invoke over a keep-alive TLS connection
+--   4. on a nonce 403: invalidate that instance (failover) and retry once
+--   5. decrypt; record TTFT for the selector; export usage to metrics
+--
+-- Logging rule: never log API keys or full nonces.
 --
 
 local crypto = require("e2ee_crypto")
 local discovery = require("e2ee_discovery")
+local attest = require("e2ee_attest")
+local selector = require("instance_selector")
+local config = require("e2ee_config")
+local log = require("e2ee_log")
+local metrics = require("metrics")
 local cjson = require("cjson.safe")
 local http = require("resty.http")
 
-local API_BASE = "https://api.chutes.ai"
-
 local _M = {}
 
---- Extract API key from Authorization header or x-api-key
+--- Extract the API key from Authorization or x-api-key
 function _M.get_api_key()
     local headers = ngx.req.get_headers()
 
-    -- Check x-api-key first (Anthropic SDK uses this)
+    -- Anthropic SDK
     local key = headers["x-api-key"]
-    if key then
+    if type(key) == "table" then
+        key = key[1]
+    end
+    if key and key ~= "" then
         return key
     end
 
-    -- Fall back to Authorization header (OpenAI SDK)
+    -- OpenAI SDK
     local auth = headers["Authorization"]
-    if not auth then
+    if type(auth) == "table" then
+        auth = auth[1]
+    end
+    if not auth or auth == "" then
         return nil, "missing Authorization header"
     end
-    -- Support both "Bearer <key>" and raw "<key>" formats
-    key = auth:match("^Bearer%s+(.+)$")
-    if not key then
-        key = auth
-    end
+    key = auth:match("^[Bb]earer%s+(.+)$") or auth
     return key
 end
 
---- Send error response
+--- Route mode for this request (header overrides env)
+function _M.get_route_mode()
+    local headers = ngx.req.get_headers()
+    local mode = selector.resolve_mode(headers["x-route-mode"])
+    return mode
+end
+
+--- Send a JSON error response
 function _M.send_error(status, message)
     ngx.status = status
     ngx.header.content_type = "application/json"
@@ -53,20 +73,106 @@ function _M.send_error(status, message)
     return ngx.exit(status)
 end
 
---- Process a single SSE line
+--- Write a round-trip error (raw upstream passthrough or proxy error)
+function _M.send_round_err(round_err)
+    if round_err.raw then
+        ngx.status = round_err.status
+        ngx.header.content_type = round_err.content_type or "application/json"
+        ngx.print(round_err.message)
+        return
+    end
+    return _M.send_error(round_err.status, round_err.message)
+end
+
+--- Read the request body (memory or temp file)
+function _M.read_body()
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data()
+    if not body then
+        local file = ngx.req.get_body_file()
+        if file then
+            local f = io.open(file, "rb")
+            if f then
+                body = f:read("*a")
+                f:close()
+            end
+        end
+    end
+    return body
+end
+
+-- ---------------------------------------------------------------------------
+-- usage / cache accounting
+-- ---------------------------------------------------------------------------
+
+local function cached_tokens_from_usage(usage)
+    if type(usage) ~= "table" then
+        return nil, nil
+    end
+    local prompt = tonumber(usage.prompt_tokens) or tonumber(usage.input_tokens)
+    local cached
+    local d = usage.prompt_tokens_details
+    if type(d) == "table" then
+        cached = tonumber(d.cached_tokens)
+    end
+    cached = cached or tonumber(usage.cached_tokens) or tonumber(usage.prompt_cache_hit_tokens)
+        or tonumber(usage.cache_read_input_tokens)
+    return prompt, cached
+end
+
+local function account_usage(model, obj)
+    if type(obj) ~= "table" or type(obj.usage) ~= "table" then
+        return
+    end
+    local prompt, cached = cached_tokens_from_usage(obj.usage)
+    if prompt then
+        metrics.inc("e2ee_prompt_tokens_total", { model = model }, prompt)
+    end
+    if cached then
+        metrics.inc("e2ee_cached_tokens_total", { model = model }, cached)
+    end
+    if prompt or cached then
+        metrics.inc("e2ee_cache_events_total", { model = model, result = (cached and cached > 0) and "hit" or "miss" })
+        log.info("usage model=", model, " prompt_tokens=", prompt or "-", " cached_tokens=", cached or "-")
+    end
+end
+
+local function account_usage_json(model, json_str)
+    if type(json_str) ~= "string" or not json_str:find('"usage"', 1, true) then
+        return
+    end
+    local obj = cjson.decode(json_str)
+    if obj then
+        account_usage(model, obj)
+    end
+end
+
+local function account_usage_sse_line(model, line)
+    if type(line) ~= "string" or not line:find('"usage"', 1, true) then
+        return
+    end
+    local raw = line:match("^data:%s*(.-)%s*$")
+    if raw then
+        account_usage_json(model, raw)
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- SSE
+-- ---------------------------------------------------------------------------
+
+--- Process one SSE line. Returns event_type, data, err.
 local function process_sse_line(line, stream_key, response_sk)
     line = line:gsub("\r$", "")
 
     if not line:match("^data: ") then
-        return nil, nil, nil  -- skip non-data lines
+        return nil, nil, nil
     end
 
     local raw = line:sub(7):match("^%s*(.-)%s*$")
-
     if raw == "[DONE]" then
         return "done", nil, nil
     end
-
     if not raw or raw == "" then
         return nil, nil, nil
     end
@@ -87,7 +193,9 @@ local function process_sse_line(line, stream_key, response_sk)
         if not stream_key then
             return "error", nil, "received e2e chunk before e2e_init"
         end
+        local t0 = ngx.now()
         local decrypted, err = crypto.decrypt_stream_chunk(event.e2e, stream_key)
+        metrics.observe("e2ee_crypto_seconds", { op = "stream_open" }, ngx.now() - t0)
         if not decrypted then
             return "error", nil, "chunk decryption failed: " .. (err or "unknown")
         end
@@ -97,72 +205,133 @@ local function process_sse_line(line, stream_key, response_sk)
         return "passthrough", line, nil
 
     elseif event.e2e_error then
-        local error_data = cjson.encode({error = event.e2e_error})
-        return "chunk", "data: " .. error_data, nil
+        return "chunk", "data: " .. cjson.encode({ error = event.e2e_error }), nil
     end
 
     return nil, nil, nil
 end
 
---- E2EE round-trip: encrypt request, send, decrypt response
--- For non-streaming: returns (decrypted_json_string, nil) or (nil, {status=N, message=S})
--- For streaming: calls on_chunk(line) for each decrypted SSE data line, on_chunk(nil) at end
-function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, on_chunk)
+-- ---------------------------------------------------------------------------
+-- upstream connection
+-- ---------------------------------------------------------------------------
+
+local function connect_upstream()
+    local httpc = http.new()
+    httpc:set_timeouts(config.UPSTREAM_CONNECT_TIMEOUT_MS,
+                       config.UPSTREAM_SEND_TIMEOUT_MS,
+                       config.UPSTREAM_READ_TIMEOUT_MS)
+
+    local parsed, perr = httpc:parse_uri(config.API_BASE .. "/e2e/invoke", false)
+    if not parsed then
+        return nil, nil, nil, "bad API_BASE: " .. tostring(perr)
+    end
+    local scheme, host, port, path = parsed[1], parsed[2], parsed[3], parsed[4]
+
+    -- Table-form connect: lua-resty-http keys the keepalive pool on
+    -- scheme/host/port/SNI/verify, and skips the TLS handshake on a reused
+    -- connection. The old connect()+ssl_handshake() pair did neither.
+    local ok, err = httpc:connect({
+        scheme = scheme,
+        host = host,
+        port = port,
+        ssl_verify = (scheme == "https"),
+        ssl_server_name = host,
+    })
+    if not ok then
+        return nil, nil, nil, "upstream connect failed: " .. (err or "unknown")
+    end
+
+    local reused = (httpc:get_reused_times() or 0) > 0
+    metrics.inc("e2ee_upstream_connections_total", { reused = tostring(reused) })
+    log.debug("upstream connection reused=", tostring(reused))
+    return httpc, host, path, nil
+end
+
+local function classify_error(status)
+    if status >= 500 then
+        return "5xx"
+    elseif status == 403 then
+        return "other_403"
+    else
+        return "4xx"
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- round trip
+-- ---------------------------------------------------------------------------
+
+--- E2EE round trip: encrypt request, send, decrypt response.
+-- Non-streaming: returns decrypted_json or (nil, {status=, message=, raw=?})
+-- Streaming: calls on_chunk(line) per decrypted SSE data line, on_chunk(nil) at end
+-- @param opts  optional { mode = route mode, model_label = string }
+function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, on_chunk, opts)
+    opts = opts or {}
+    local mode = opts.mode or _M.get_route_mode()
+    local path_label = e2e_path or "/v1/unknown"
     local err
+
+    local function fail(status, message, class, raw, content_type)
+        metrics.inc("e2ee_requests_total", { path = path_label, mode = mode, outcome = "error" })
+        if class then
+            metrics.inc("e2ee_upstream_errors_total", { class = class })
+        end
+        return nil, { status = status, message = message, raw = raw, content_type = content_type }
+    end
 
     -- Resolve model -> chute_id
     local chute_id
     chute_id, err = discovery.resolve_chute_id(model, api_key)
     if not chute_id then
-        return nil, {status = 404, message = err}
+        return fail(404, err)
     end
 
-    -- Try up to 2 times (retry on nonce errors)
-    local res, httpc, response_sk
+    local res, httpc, response_sk, instance, nonce
     for attempt = 1, 2 do
-        -- Get nonce (force refresh on retry)
-        local instance, nonce
-        if attempt > 1 then
-            discovery.invalidate_nonces(chute_id)
+        -- Pick an instance whose key passes attestation. A rejected instance is
+        -- dropped from affinity and a fresh discovery round is forced.
+        local att_err
+        for pick = 1, 3 do
+            local reason
+            instance, nonce, reason = discovery.get_nonce(chute_id, api_key, mode)
+            if not instance then
+                return fail(503, reason) -- get_nonce returns nil, nil, err
+            end
+            local att_ok
+            att_ok, att_err = attest.guard(chute_id, instance.instance_id, instance.e2e_pubkey, api_key)
+            if att_ok then
+                att_err = nil
+                log.debug("attempt ", attempt, ": instance=", instance.instance_id,
+                          " mode=", mode, " reason=", reason, " chute=", chute_id)
+                break
+            end
+            log.warn("attestation rejected instance ", instance.instance_id, " (pick ", pick, "/3): ", att_err)
+            attest.invalidate(instance.instance_id)
+            discovery.invalidate_nonces(chute_id, instance.instance_id)
+            instance = nil
         end
-        instance, nonce, err = discovery.get_nonce(chute_id, api_key)
         if not instance then
-            return nil, {status = 503, message = err}
+            return fail(502, "TEE attestation failed: " .. (att_err or "unknown"), "attest")
         end
 
-        ngx.log(ngx.INFO, "attempt ", attempt, ": instance=", instance.instance_id,
-                " nonce=", nonce, " chute=", chute_id,
-                " auth_len=", #api_key, " auth_prefix=", api_key:sub(1, 8))
-
-        -- Build encrypted request
+        -- Encrypt
+        local t_seal = ngx.now()
         local blob
         blob, response_sk, err = crypto.build_e2ee_request(instance.e2e_pubkey, body_json)
+        metrics.observe("e2ee_crypto_seconds", { op = "seal" }, ngx.now() - t_seal)
         if not blob then
-            return nil, {status = 500, message = "encryption failed: " .. (err or "unknown")}
+            return fail(500, "encryption failed: " .. (err or "unknown"))
         end
 
-        -- Connect to upstream
-        httpc = http.new()
-        httpc:set_timeouts(5000, 30000, 300000)
-
-        local url_parts = httpc:parse_uri(API_BASE .. "/e2e/invoke")
-        local scheme, host, port, path = url_parts[1], url_parts[2], url_parts[3], url_parts[4]
-
-        local ok
-        ok, err = httpc:connect(host, port)
-        if not ok then
-            return nil, {status = 502, message = "upstream connect failed: " .. (err or "unknown")}
+        -- Connect + send
+        local host, path, cerr
+        httpc, host, path, cerr = connect_upstream()
+        if not httpc then
+            selector.invalidate(chute_id, instance.instance_id)
+            return fail(502, cerr, "connect")
         end
 
-        if scheme == "https" then
-            local session
-            session, err = httpc:ssl_handshake(nil, host, true)
-            if not session then
-                return nil, {status = 502, message = "upstream SSL failed: " .. (err or "unknown")}
-            end
-        end
-
-        -- Send request
+        local t_send = ngx.now()
         res, err = httpc:request({
             method = "POST",
             path = path,
@@ -176,161 +345,184 @@ function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, o
                 ["X-E2E-Stream"] = tostring(is_streaming),
                 ["X-E2E-Path"] = e2e_path,
                 ["Content-Type"] = "application/octet-stream",
+                ["Content-Length"] = tostring(#blob),
             },
         })
 
         if not res then
-            return nil, {status = 502, message = "upstream request failed: " .. (err or "unknown")}
+            httpc:close()
+            selector.record(chute_id, instance.instance_id, nil, false)
+            selector.invalidate(chute_id, instance.instance_id)
+            local class = (err and err:find("timeout", 1, true)) and "timeout" or "connect"
+            return fail(502, "upstream request failed: " .. (err or "unknown"), class)
         end
+        instance.ttfb = ngx.now() - t_send
 
-        -- Retry on 403 nonce errors
+        -- Retry once on a nonce 403; failover happens through invalidate.
         if res.status == 403 and attempt < 2 then
-            local err_body = res:read_body()
-            ngx.log(ngx.WARN, "403 on attempt ", attempt,
-                    ": body=", err_body or "(nil)",
-                    " instance=", instance.instance_id,
-                    " nonce_prefix=", nonce:sub(1, 12),
-                    " nonce_len=", #nonce,
-                    " chute=", chute_id)
-            if err_body and err_body:find("nonce") then
-                ngx.log(ngx.WARN, "nonce rejected, retrying with fresh nonce")
+            local err_body = res:read_body() or ""
+            log.warn("403 on attempt ", attempt, ": instance=", instance.instance_id,
+                     " nonce_prefix=", nonce:sub(1, 8), " chute=", chute_id,
+                     " body=", err_body:sub(1, 200))
+            if err_body:find("nonce") then
+                metrics.inc("e2ee_upstream_errors_total", { class = "nonce_403" })
+                log.warn("nonce rejected, retrying on another instance")
                 httpc:close()
-                -- continue to next attempt
+                discovery.invalidate_nonces(chute_id, instance.instance_id)
             else
-                -- Non-nonce 403, passthrough
-                local body_text = err_body or ""
                 httpc:set_keepalive()
-                return nil, {status = 403, message = body_text, raw = true}
+                return fail(403, err_body, "other_403", true)
             end
         else
             break
         end
     end
 
-    -- Non-200: passthrough error
+    ngx.header["X-E2EE-Instance-Id"] = instance.instance_id
+    ngx.header["X-E2EE-Route-Mode"] = mode
+
+    -- Non-200: pass the upstream error through
     if res.status ~= 200 then
         local err_body = res:read_body() or ""
         httpc:set_keepalive()
-        return nil, {status = res.status, message = err_body, raw = true,
-                     content_type = res.headers["Content-Type"]}
+        selector.record(chute_id, instance.instance_id, nil, false)
+        if res.status >= 500 then
+            selector.invalidate(chute_id, instance.instance_id)
+        end
+        return fail(res.status, err_body, classify_error(res.status), true, res.headers["Content-Type"])
     end
 
     if not is_streaming then
-        -- Non-streaming: read full body, decrypt, return
         local response_blob = res:read_body()
         if not response_blob or #response_blob == 0 then
             httpc:set_keepalive()
-            return nil, {status = 502, message = "empty response from upstream"}
+            selector.record(chute_id, instance.instance_id, nil, false)
+            return fail(502, "empty response from upstream", "empty")
         end
 
+        local t_open = ngx.now()
         local decrypted
         decrypted, err = crypto.decrypt_response(response_blob, response_sk)
-        if not decrypted then
-            httpc:set_keepalive()
-            return nil, {status = 502, message = "failed to decrypt response: " .. (err or "unknown")}
-        end
-
+        metrics.observe("e2ee_crypto_seconds", { op = "open" }, ngx.now() - t_open)
         httpc:set_keepalive()
-        return decrypted, nil
-    else
-        -- Streaming: parse SSE, decrypt chunks, call on_chunk for each
-        local reader = res.body_reader
-        if not reader then
-            httpc:set_keepalive()
-            return nil, {status = 502, message = "no body reader"}
+        if not decrypted then
+            selector.record(chute_id, instance.instance_id, nil, false)
+            return fail(502, "failed to decrypt response: " .. (err or "unknown"), "decrypt")
         end
 
-        local buffer = ""
-        local stream_key = nil
-        local done_sent = false
+        selector.record(chute_id, instance.instance_id, instance.ttfb, true)
+        metrics.observe("e2ee_ttft_seconds", { mode = mode }, instance.ttfb)
+        metrics.inc("e2ee_requests_total", { path = path_label, mode = mode, outcome = "ok" })
+        account_usage_json(model, decrypted)
+        return decrypted, nil
+    end
 
-        while true do
-            local chunk
-            chunk, err = reader(8192)
-            if err then
-                ngx.log(ngx.ERR, "stream read error: ", err)
+    -- Streaming: parse SSE, decrypt chunks, call on_chunk for each
+    local reader = res.body_reader
+    if not reader then
+        httpc:set_keepalive()
+        return fail(502, "no body reader")
+    end
+
+    local buffer = ""
+    local stream_key = nil
+    local done_sent = false
+    local first_chunk_at = nil
+    local t_stream0 = ngx.now()
+    local had_error = false
+
+    local function deliver(line)
+        if not first_chunk_at then
+            first_chunk_at = ngx.now()
+            local ttft = first_chunk_at - t_stream0 + (instance.ttfb or 0)
+            selector.record(chute_id, instance.instance_id, ttft, true)
+            metrics.observe("e2ee_ttft_seconds", { mode = mode }, ttft)
+        end
+        metrics.inc("e2ee_stream_chunks_total", nil, 1)
+        account_usage_sse_line(model, line)
+        on_chunk(line)
+    end
+
+    local function handle(event_type, data, event_err)
+        if event_type == "init" then
+            stream_key = data
+        elseif event_type == "chunk" or event_type == "passthrough" then
+            deliver(data)
+        elseif event_type == "done" then
+            on_chunk(nil)
+            done_sent = true
+        elseif event_type == "error" then
+            had_error = true
+            log.err("stream error: ", event_err)
+            metrics.inc("e2ee_upstream_errors_total", { class = "decrypt" })
+            on_chunk("data: " .. cjson.encode({ error = { message = event_err, type = "proxy_error" } }))
+            on_chunk(nil)
+            done_sent = true
+        end
+    end
+
+    while not done_sent do
+        local chunk
+        chunk, err = reader(8192)
+        if err then
+            log.err("stream read error: ", err)
+            metrics.inc("e2ee_upstream_errors_total", { class = err:find("timeout", 1, true) and "timeout" or "5xx" })
+            had_error = true
+            break
+        end
+        if not chunk then
+            break
+        end
+
+        buffer = buffer .. chunk
+        while not done_sent do
+            local pos = buffer:find("\n", 1, true)
+            if not pos then
                 break
             end
-            if not chunk then break end
-
-            buffer = buffer .. chunk
-
-            while true do
-                local pos = buffer:find("\n")
-                if not pos then break end
-
-                local line = buffer:sub(1, pos - 1)
-                buffer = buffer:sub(pos + 1)
-
-                if line ~= "" then
-                    local event_type, data, event_err = process_sse_line(
-                        line, stream_key, response_sk
-                    )
-
-                    if event_type == "init" then
-                        stream_key = data
-
-                    elseif event_type == "chunk" then
-                        on_chunk(data)
-
-                    elseif event_type == "passthrough" then
-                        on_chunk(data)
-
-                    elseif event_type == "done" then
-                        on_chunk(nil)
-                        done_sent = true
-
-                    elseif event_type == "error" then
-                        ngx.log(ngx.ERR, "stream error: ", event_err)
-                        on_chunk("data: " .. cjson.encode({
-                            error = {message = event_err}
-                        }))
-                        on_chunk(nil)
-                        done_sent = true
-                    end
-                end
+            local line = buffer:sub(1, pos - 1)
+            buffer = buffer:sub(pos + 1)
+            if line ~= "" then
+                handle(process_sse_line(line, stream_key, response_sk))
             end
         end
-
-        -- Process remaining buffer
-        if buffer ~= "" and not done_sent then
-            local event_type, data, _ = process_sse_line(
-                buffer, stream_key, response_sk
-            )
-            if event_type == "chunk" or event_type == "passthrough" then
-                on_chunk(data)
-            elseif event_type == "done" then
-                on_chunk(nil)
-                done_sent = true
-            end
-        end
-
-        -- Always signal end of stream
-        if not done_sent then
-            on_chunk(nil)
-        end
-
-        httpc:set_keepalive()
-        return true, nil
     end
+
+    -- Trailing partial line
+    if buffer ~= "" and not done_sent then
+        local event_type, data = process_sse_line(buffer, stream_key, response_sk)
+        if event_type == "chunk" or event_type == "passthrough" then
+            deliver(data)
+        elseif event_type == "done" then
+            on_chunk(nil)
+            done_sent = true
+        end
+    end
+
+    if not done_sent then
+        on_chunk(nil)
+    end
+
+    if had_error then
+        httpc:close()
+        selector.record(chute_id, instance.instance_id, nil, false)
+        metrics.inc("e2ee_requests_total", { path = path_label, mode = mode, outcome = "stream_error" })
+    else
+        httpc:set_keepalive()
+        if not first_chunk_at then
+            selector.record(chute_id, instance.instance_id, instance.ttfb, true)
+        end
+        metrics.inc("e2ee_requests_total", { path = path_label, mode = mode, outcome = "ok" })
+    end
+    return true, nil
 end
 
---- Main handler for /v1/chat/completions (and other /v1/* paths)
-function _M.handle()
-    -- Read request body
-    ngx.req.read_body()
-    local body = ngx.req.get_body_data()
-    if not body then
-        local file = ngx.req.get_body_file()
-        if file then
-            local f = io.open(file, "rb")
-            if f then
-                body = f:read("*a")
-                f:close()
-            end
-        end
-    end
+-- ---------------------------------------------------------------------------
+-- content handler for /v1/* (OpenAI-compatible passthrough)
+-- ---------------------------------------------------------------------------
 
+function _M.handle()
+    local body = _M.read_body()
     if not body then
         return _M.send_error(400, "missing request body")
     end
@@ -356,45 +548,33 @@ function _M.handle()
     if not is_streaming then
         local decrypted, round_err = _M.e2ee_round_trip(api_key, model, body, false, original_path)
         if not decrypted then
-            if round_err.raw then
-                ngx.status = round_err.status
-                ngx.header.content_type = round_err.content_type or "application/json"
-                ngx.print(round_err.message)
-                return
-            end
-            return _M.send_error(round_err.status, round_err.message)
+            return _M.send_round_err(round_err)
         end
         ngx.header.content_type = "application/json"
         ngx.print(decrypted)
-    else
-        -- Set up streaming headers
-        ngx.header.content_type = "text/event-stream"
-        ngx.header.cache_control = "no-cache"
-        ngx.header["X-Accel-Buffering"] = "no"
+        return
+    end
 
-        local _, round_err = _M.e2ee_round_trip(api_key, model, body, true, original_path,
-            function(line)
-                if line == nil then
-                    ngx.print("data: [DONE]\n\n")
-                    ngx.flush(true)
-                else
-                    local trimmed = line:gsub("%s+$", "")
-                    if trimmed ~= "" then
-                        ngx.print(trimmed .. "\n\n")
-                        ngx.flush(true)
-                    end
-                end
-            end)
+    ngx.header.content_type = "text/event-stream"
+    ngx.header.cache_control = "no-cache"
+    ngx.header["X-Accel-Buffering"] = "no"
 
-        if round_err then
-            if round_err.raw then
-                ngx.status = round_err.status
-                ngx.header.content_type = round_err.content_type or "application/json"
-                ngx.print(round_err.message)
+    local _, round_err = _M.e2ee_round_trip(api_key, model, body, true, original_path,
+        function(line)
+            if line == nil then
+                ngx.print("data: [DONE]\n\n")
+                ngx.flush(true)
             else
-                _M.send_error(round_err.status, round_err.message)
+                local trimmed = line:gsub("%s+$", "")
+                if trimmed ~= "" then
+                    ngx.print(trimmed .. "\n\n")
+                    ngx.flush(true)
+                end
             end
-        end
+        end)
+
+    if round_err then
+        _M.send_round_err(round_err)
     end
 end
 

@@ -13,20 +13,7 @@ local resp_fmt = require("responses_format")
 local _M = {}
 
 function _M.handle()
-    -- Read request body
-    ngx.req.read_body()
-    local body = ngx.req.get_body_data()
-    if not body then
-        local file = ngx.req.get_body_file()
-        if file then
-            local f = io.open(file, "rb")
-            if f then
-                body = f:read("*a")
-                f:close()
-            end
-        end
-    end
-
+    local body = e2ee.read_body()
     if not body then
         return e2ee.send_error(400, "missing request body")
     end
@@ -53,22 +40,13 @@ function _M.handle()
     local oai_body = cjson.encode(oai_request)
 
     if not is_streaming then
-        -- Non-streaming
         local decrypted, round_err = e2ee.e2ee_round_trip(
             api_key, model, oai_body, false, "/v1/chat/completions"
         )
-
         if not decrypted then
-            if round_err.raw then
-                ngx.status = round_err.status
-                ngx.header.content_type = round_err.content_type or "application/json"
-                ngx.print(round_err.message)
-                return
-            end
-            return e2ee.send_error(round_err.status, round_err.message)
+            return e2ee.send_round_err(round_err)
         end
 
-        -- Translate response back to Responses format
         local response = resp_fmt.response_from_openai(decrypted, model, resp_body)
         if not response then
             return e2ee.send_error(502, "failed to translate response")
@@ -76,43 +54,32 @@ function _M.handle()
 
         ngx.header.content_type = "application/json"
         ngx.print(resp_fmt.encode(response))
-    else
-        -- Streaming
-        ngx.header.content_type = "text/event-stream"
-        ngx.header.cache_control = "no-cache"
-        ngx.header["X-Accel-Buffering"] = "no"
+        return
+    end
 
-        local stream_state = resp_fmt.new_stream_state(model)
+    ngx.header.content_type = "text/event-stream"
+    ngx.header.cache_control = "no-cache"
+    ngx.header["X-Accel-Buffering"] = "no"
 
-        local _, round_err = e2ee.e2ee_round_trip(
-            api_key, model, oai_body, true, "/v1/chat/completions",
-            function(line)
-                if line == nil then
-                    -- Stream ended, emit closing events
-                    local end_events = resp_fmt.stream_end(stream_state)
-                    for _, evt in ipairs(end_events) do
-                        ngx.print(evt)
-                        ngx.flush(true)
-                    end
-                else
-                    -- Translate chunk
-                    local events = resp_fmt.stream_chunk_from_openai(stream_state, line)
-                    for _, evt in ipairs(events) do
-                        ngx.print(evt)
-                        ngx.flush(true)
-                    end
-                end
-            end)
+    local stream_state = resp_fmt.new_stream_state(model)
 
-        if round_err then
-            if round_err.raw then
-                ngx.status = round_err.status
-                ngx.header.content_type = round_err.content_type or "application/json"
-                ngx.print(round_err.message)
+    local _, round_err = e2ee.e2ee_round_trip(
+        api_key, model, oai_body, true, "/v1/chat/completions",
+        function(line)
+            local events
+            if line == nil then
+                events = resp_fmt.stream_end(stream_state)
             else
-                e2ee.send_error(round_err.status, round_err.message)
+                events = resp_fmt.stream_chunk_from_openai(stream_state, line)
             end
-        end
+            for _, evt in ipairs(events) do
+                ngx.print(evt)
+                ngx.flush(true)
+            end
+        end)
+
+    if round_err then
+        e2ee.send_round_err(round_err)
     end
 end
 
