@@ -199,6 +199,35 @@ T.test("verify: evidence array with several instances' quotes, ours not first", 
     T.truthy(err:find("none of 2 quote", 1, true), err)
 end)
 
+T.test("verify: picks the evidence entry for our instance_id even if another entry would bind", function()
+    attest._reset()
+    attest._set_mode("enforce")
+    attest._deps.fetch = function(url)
+        local nonce_raw = from_hex(url:match("nonce=(%x+)"))
+        local ours = build_quote({ report_data = sha256(to_hex(nonce_raw) .. PK_B64) .. string.rep("\0", 32) })
+        local arr = setmetatable({
+            { instance_id = "someone-else", quote = ngx.encode_base64(ours) },
+            { instance_id = "inst-20", quote = ngx.encode_base64(ours),
+              gpu_evidence = setmetatable({ { arch = "BLACKWELL", evidence = "x" } }, { __jsontype = "array" }) },
+        }, { __jsontype = "array" })
+        return 200, T.json.encode({ evidence = arr, failed_instance_ids = setmetatable({}, { __jsontype = "array" }) }), nil
+    end
+    T.truthy(attest.verify("chute1", "inst-20", PK_B64, "cpk_test"))
+    T.truthy(T.log_contains("at=.evidence.2.quote"), "entry matched by instance_id, not the first quote")
+end)
+
+T.test("verify: instance in failed_instance_ids is reported explicitly", function()
+    attest._reset()
+    attest._set_mode("enforce")
+    attest._deps.fetch = function()
+        return 200, T.json.encode({ evidence = setmetatable({}, { __jsontype = "array" }),
+                                    failed_instance_ids = setmetatable({ "inst-21" }, { __jsontype = "array" }) }), nil
+    end
+    local ok, err = attest.verify("chute1", "inst-21", PK_B64, "cpk_test")
+    T.falsy(ok)
+    T.truthy(err:find("failed_instance_ids", 1, true), err)
+end)
+
 T.test("verify: finds a hex quote", function()
     attest._reset()
     attest._deps.fetch = fake_endpoint(function(_, hex)

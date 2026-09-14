@@ -25,12 +25,21 @@
 --
 -- LIVE SCHEMA (confirmed against api.chutes.ai on 2026-09-14)
 --   GET {api}/chutes/{chute_id}/evidence?nonce={nonce_hex}
---   -> { "evidence": [ { ..., "quote": <base64 TDX quote v4>, ... }, ... ] }
+--   -> {
+--        "evidence": [ {                       -- one entry per instance
+--            "instance_id":   "<uuid>",
+--            "quote":         "<base64 TDX quote v4, ~5 KB incl. signature>",
+--            "certificate":   "...", "signature": "...", "attested_body": "...",
+--            "gpu_evidence":  [ { "arch": "BLACKWELL", "certificate": "...", "evidence": "..." } ]
+--        } ],
+--        "failed_instance_ids": [ ... ]
+--      }
 --   report_data[0:32] = SHA256(nonce_hex || e2e_pubkey_b64)   (both as the
 --   ASCII strings that travel on the wire)
---   The evidence array can hold one entry per instance of the chute, so every
---   quote in the response is tried and the one binding OUR nonce to THIS
---   instance's key is accepted.
+--   The entry whose instance_id matches is used when present; otherwise every
+--   quote in the document is tried and the one binding OUR nonce to THIS
+--   instance's key is accepted. The per-entry signature/certificate and the
+--   GPU evidence are NOT verified (see README).
 --
 --   The module still locates quotes structurally (any base64/hex string with
 --   a valid TDX header) and keeps the other URL / encoding candidates as
@@ -261,6 +270,30 @@ local function find_quotes(node, path, depth, out)
 end
 _M._find_quotes = find_quotes
 
+-- Prefer the evidence entry for our instance. Returns node, path_prefix, or
+-- nil, reason when the API explicitly reports the instance as failed.
+local function select_evidence(data, instance_id)
+    if type(data) ~= "table" then
+        return data, ""
+    end
+    if type(data.evidence) == "table" then
+        for i, entry in ipairs(data.evidence) do
+            if type(entry) == "table" and entry.instance_id == instance_id then
+                return entry, ".evidence." .. i
+            end
+        end
+    end
+    if type(data.failed_instance_ids) == "table" then
+        for _, id in ipairs(data.failed_instance_ids) do
+            if id == instance_id then
+                return nil, "listed in failed_instance_ids"
+            end
+        end
+    end
+    return data, ""
+end
+_M._select_evidence = select_evidence
+
 -- Describe a JSON document's shape (keys, types, string lengths) for the
 -- observe-mode log without dumping large blobs.
 local function describe(node, depth)
@@ -425,7 +458,16 @@ function _M.verify(chute_id, instance_id, e2e_pubkey_b64, api_key)
         return nil, "attestation fetch failed: " .. (ferr or "unknown")
     end
 
-    local quotes = find_quotes(data, "", 0)
+    local node, prefix = select_evidence(data, instance_id)
+    if not node then
+        return nil, "attestation for instance " .. instance_id .. " unavailable: " .. prefix
+            .. " (" .. url .. ")"
+    end
+    local quotes = find_quotes(node, prefix, 0)
+    if #quotes == 0 and node ~= data then
+        -- entry without a quote: fall back to the whole document
+        quotes = find_quotes(data, "", 0)
+    end
     if #quotes == 0 then
         return nil, "no TDX quote found in attestation response from " .. url
             .. "; response shape: " .. describe(data)

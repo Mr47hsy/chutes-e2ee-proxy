@@ -49,7 +49,7 @@ jobs:
       - name: Build image (linux/amd64)
         run: docker build --platform linux/amd64 -t e2ee-proxy:ci .
 
-      - name: Lua test needing the real .so (resty CLI from the alpine-fat image)
+      - name: Lua test needing the real .so (resty CLI from the bookworm-fat image)
         run: |
           cid=$(docker create e2ee-proxy:ci)
           docker cp "$cid:/usr/local/openresty/lib/libe2ee_proxy.so" ./libe2ee_proxy.so
@@ -57,7 +57,7 @@ jobs:
           docker run --rm --entrypoint /usr/local/openresty/bin/resty \
             -v "$PWD/libe2ee_proxy.so:/usr/local/openresty/lib/libe2ee_proxy.so:ro" \
             -v "$PWD/tests:/tests:ro" -v "$PWD/lua:/workspace/lua:ro" \
-            openresty/openresty:1.31.1.1-alpine-fat /tests/test_json_array_roundtrip.lua
+            openresty/openresty:1.31.1.1-bookworm-fat /tests/test_json_array_roundtrip.lua
 
       - name: Set up Python for the mock upstream
         uses: actions/setup-python@v5
@@ -109,14 +109,14 @@ jobs:
           echo "=== mock ==="; cat mock.log || true
           for n in proxy-observe proxy-enforce proxy-small; do echo "=== $n ==="; docker logs $n 2>&1 | tail -200; done
 
-  image-debian:
+  image-alpine:
     runs-on: ubuntu-22.04
     needs: [lint-and-unit, native]
     steps:
       - uses: actions/checkout@v4
-      - name: Build Debian variant and check it starts
+      - name: Build Alpine variant and check it starts
         run: |
-          docker build --platform linux/amd64 -f Dockerfile.debian -t e2ee-proxy:debian .
-          docker run -d --name proxy-debian -p 8446:443 e2ee-proxy:debian
+          docker build --platform linux/amd64 -f Dockerfile.alpine -t e2ee-proxy:alpine .
+          docker run -d --name proxy-alpine -p 8446:443 e2ee-proxy:alpine
           for i in $(seq 1 30); do curl -skf https://127.0.0.1:8446/health >/dev/null && break; sleep 1; done
           curl -skf https://127.0.0.1:8446/health

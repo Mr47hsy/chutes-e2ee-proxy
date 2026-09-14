@@ -14,7 +14,7 @@ replaces both with an open native library and standard TLS, and adds:
 | Area | Change |
 |---|---|
 | Build | `docker build .` works with nothing but this repository; native crypto is plain C on OpenSSL + zlib + vendored PQClean ML-KEM-768, with NIST/RFC self-tests as a build gate |
-| Image | `openresty/openresty:1.31.1.1-alpine` base (64 MB compressed) instead of the 285 MB jammy image; a Debian bookworm variant (`Dockerfile.debian`, 38 MB base) is one flag away |
+| Image | `openresty/openresty:1.31.1.1-bookworm` base, 109 MB final image instead of ~500 MB on the upstream jammy base; an Alpine variant (`Dockerfile.alpine`, 182 MB) is one flag away |
 | Routing | Instance selection modes `agent` / `balanced` / `performance` / `default`, per-request `X-Route-Mode` header, automatic failover |
 | Security | TEE attestation of instance keys (observe/enforce), CORS allowlist, no API-key fragments in logs, unprivileged container user, HKDF/AEAD/gzip via OpenSSL |
 | Operations | `/metrics` (Prometheus), `X-Request-Id`, structured 413, 64 MB bodies, 15-minute read timeout, health check |
@@ -38,9 +38,9 @@ Client (OpenAI SDK / Anthropic SDK / curl)
 ## Quick start
 
 ```bash
-# build (linux/amd64 by default, Alpine base)
+# build (linux/amd64 by default, Debian bookworm base)
 ./build.sh                      # -> image e2ee-proxy
-./build.sh --debian             # same, on the Debian bookworm base (glibc)
+./build.sh --alpine             # same layout on Alpine (musl)
 
 # run: self-signed TLS, balanced routing, attestation enforced
 docker run --rm -p 8443:443 e2ee-proxy
@@ -165,11 +165,21 @@ the public key does not. Pinning measurements obtained from an out-of-band
 DCAP verification closes most of the remaining gap.
 
 Confirmed against the live API (2026-09-14): the evidence endpoint is
-`GET /chutes/{chute_id}/evidence?nonce=<32 bytes hex>`, the response carries
-an `evidence` array with a base64 TDX quote (v4) per entry, and
-`report_data[0:32] = SHA256(nonce_hex ‖ e2e_pubkey_base64)`. Because the
-array can hold one quote per instance, every quote is tried and the one that
-binds our nonce to the chosen instance's key is accepted.
+`GET /chutes/{chute_id}/evidence?nonce=<32 bytes hex>` and returns
+
+```
+{ "evidence": [ { "instance_id": "...", "quote": "<base64 TDX quote v4>",
+                  "certificate": "...", "signature": "...", "attested_body": "...",
+                  "gpu_evidence": [ { "arch": "BLACKWELL", "certificate": "...", "evidence": "..." } ] } ],
+  "failed_instance_ids": [] }
+```
+
+with `report_data[0:32] = SHA256(nonce_hex ‖ e2e_pubkey_base64)`. The entry
+whose `instance_id` matches the chosen instance is used (falling back to any
+quote in the document that binds our nonce to that key). Not verified today,
+in addition to the quote signature and PCK chain: the per-entry
+`signature`/`certificate` over `attested_body`, and the NVIDIA GPU evidence.
+Both are candidates for a follow-up once their formats are documented.
 
 - `E2EE_ATTEST=enforce` (default): instances that fail are rejected (up to
   three are tried per request) and the request returns
@@ -332,12 +342,15 @@ appears in the logs.
   Apple Silicon Mac the builder stage runs under Rosetta/QEMU and still
   produces an x86_64 `.so`; `./build.sh --platform linux/arm64` builds a
   native image for local testing.
-- Default base is Alpine (musl); the native library is compiled in an
-  `alpine:3.23` stage so libc and OpenSSL match the runtime. Inside nginx the
-  loader reuses the `libcrypto.so.3` OpenResty bundles, so no version pin is
-  needed beyond the OpenSSL 3 soname.
-- `Dockerfile.debian` is the same layout on `debian:bookworm-slim` +
-  `openresty/openresty:1.31.1.1-bookworm` for environments that prefer glibc.
+- Default base is Debian bookworm (glibc): the native library is compiled in
+  a `debian:bookworm-slim` stage and runs on
+  `openresty/openresty:1.31.1.1-bookworm`. Inside nginx the loader reuses
+  the `libcrypto.so.3` OpenResty bundles, so no version pin is needed beyond
+  the OpenSSL 3 soname.
+- `Dockerfile.alpine` is the same layout on `alpine:3.23` +
+  `openresty/openresty:1.31.1.1-alpine` (musl). It ends up larger (182 MB vs
+  109 MB) because the official Alpine OpenResty image bundles gd/geoip/libxslt
+  and its own OpenSSL; use it only if you standardise on Alpine.
 - Runs as an unprivileged user; port binding uses `cap_net_bind_service` on
   the nginx binary.
 - `worker_processes 1` is deliberate: nonce batches, routing state, metrics
@@ -349,15 +362,15 @@ appears in the logs.
 
 ## Known limitations / follow-ups
 
-- Attestation signature and PCK chain are not verified (DCAP QVL sidecar or
-  an in-`.so` verifier would close this).
+- Attestation: the TDX quote signature and PCK chain, the per-entry
+  `signature`/`certificate`, and the GPU evidence are not verified (a DCAP
+  QVL / NVIDIA NRAS sidecar or an in-`.so` verifier would close this).
 - Nonce batches are fetched synchronously when they expire (about one extra
   round trip when requests are more than ~55 s apart); background prefetch
   is a possible follow-up.
 - Single worker by design (see above).
-- OpenResty publishes no Debian 13 (trixie) image; the Debian variant uses
-  bookworm. `alpine-slim` (22 MB) exists but has not been validated with the
-  self-signed certificate flow, so the default is the plain `alpine` tag.
+- OpenResty publishes no Debian 13 (trixie) image; bookworm is the newest
+  Debian base. An `alpine-slim` OpenResty tag exists but was not evaluated.
 
 ## License
 

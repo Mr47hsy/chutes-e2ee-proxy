@@ -2,8 +2,8 @@
 #
 # Build the e2ee-proxy Docker image.
 #
-#   ./build.sh                       # Alpine base (Dockerfile), linux/amd64, tag e2ee-proxy
-#   ./build.sh --debian              # Debian bookworm base (Dockerfile.debian)
+#   ./build.sh                       # Debian bookworm base (Dockerfile), linux/amd64, tag e2ee-proxy
+#   ./build.sh --alpine              # Alpine base (Dockerfile.alpine)
 #   ./build.sh --tag myrepo/e2ee-proxy:1.0
 #   ./build.sh --mlkem-backend kyber-r3   # only if end-to-end tests show the
 #                                         # instances speak Kyber round-3
@@ -25,7 +25,8 @@ while [[ $# -gt 0 ]]; do
         --tag)            TAG="$2"; shift 2 ;;
         --platform)       PLATFORM="$2"; shift 2 ;;
         --mlkem-backend)  MLKEM_BACKEND="$2"; shift 2 ;;
-        --debian)         DOCKERFILE="Dockerfile.debian"; shift ;;
+        --alpine)         DOCKERFILE="Dockerfile.alpine"; shift ;;
+        --debian)         DOCKERFILE="Dockerfile"; shift ;;   # kept for compatibility; Debian is the default
         --dockerfile)     DOCKERFILE="$2"; shift 2 ;;
         --no-cache)       EXTRA_ARGS+=("--no-cache"); shift ;;
         --progress)       EXTRA_ARGS+=("--progress" "$2"); shift 2 ;;
