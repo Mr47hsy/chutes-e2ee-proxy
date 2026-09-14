@@ -48,7 +48,7 @@ cat <<EOF
 
 === Build complete: $TAG ===
 
-Run (self-signed TLS, balanced routing, attestation in observe mode):
+Run (self-signed TLS, balanced routing, attestation enforced):
   docker run --rm -p 8443:443 $TAG
 
 Then trust the certificate (printed at startup) and point clients at

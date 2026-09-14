@@ -169,6 +169,36 @@ T.test("verify: finds a base64 quote in a nested field", function()
     T.truthy(T.log_contains("attestation OK instance=inst-1"))
 end)
 
+T.test("verify: evidence array with several instances' quotes, ours not first", function()
+    attest._reset()
+    attest._set_mode("enforce")
+    attest._deps.fetch = function(url)
+        local nonce_raw = from_hex(url:match("nonce=(%x+)"))
+        local other = build_quote({ report_data = sha256(nonce_raw .. string.rep("\xCD", 1184)) .. string.rep("\0", 32) })
+        local ours = build_quote({ report_data = sha256(to_hex(nonce_raw) .. PK_B64) .. string.rep("\0", 32) })
+        local arr = setmetatable({
+            { instance_id = "other", quote = ngx.encode_base64(other) },
+            { instance_id = "inst-11", quote = ngx.encode_base64(ours) },
+        }, { __jsontype = "array" })
+        return 200, T.json.encode({ evidence = arr }), nil
+    end
+    local ok, err = attest.verify("chute1", "inst-11", PK_B64, "cpk_test")
+    T.truthy(ok, err)
+    T.truthy(T.log_contains("binding=sha256(nonce_hex||pk_b64)"), "live binding formula recognised")
+    T.truthy(T.log_contains("at=.evidence.2.quote"), "second array element matched")
+    -- and a response where no quote binds our key is rejected, naming the count
+    attest._reset()
+    attest._deps.fetch = function(url)
+        local nonce_raw = from_hex(url:match("nonce=(%x+)"))
+        local other = build_quote({ report_data = sha256(nonce_raw .. string.rep("\xCD", 1184)) .. string.rep("\0", 32) })
+        return 200, T.json.encode({ evidence = setmetatable({ { quote = ngx.encode_base64(other) },
+                                                              { quote = ngx.encode_base64(other) } }, { __jsontype = "array" }) }), nil
+    end
+    ok, err = attest.verify("chute1", "inst-12", PK_B64, "cpk_test")
+    T.falsy(ok)
+    T.truthy(err:find("none of 2 quote", 1, true), err)
+end)
+
 T.test("verify: finds a hex quote", function()
     attest._reset()
     attest._deps.fetch = fake_endpoint(function(_, hex)
@@ -220,7 +250,7 @@ T.test("verify: remembers the endpoint that worked", function()
     local urls = {}
     attest._deps.fetch = function(url)
         urls[#urls + 1] = url
-        if url:find("/evidence", 1, true) then
+        if url:find("/instances/", 1, true) and url:find("/evidence", 1, true) then
             local nonce_raw = from_hex(url:match("nonce=(%x+)"))
             local q = build_quote({ report_data = sha256(nonce_raw .. PK_RAW) .. string.rep("\0", 32) })
             return 200, T.json.encode({ quote = ngx.encode_base64(q) }), nil
@@ -232,7 +262,7 @@ T.test("verify: remembers the endpoint that worked", function()
     T.truthy(n_first >= 2, "probed several candidates")
     T.truthy(attest.verify("chute1", "inst-7", PK_B64, "cpk_test"))
     T.eq(#urls, n_first + 1, "second instance hit the known-good endpoint first")
-    T.truthy(urls[#urls]:find("/evidence", 1, true))
+    T.truthy(urls[#urls]:find("/instances/", 1, true) and urls[#urls]:find("/evidence", 1, true))
 end)
 
 T.test("guard: enforce rejects, observe allows and logs, off skips", function()
@@ -272,6 +302,19 @@ T.test("guard(observe): failures are negatively cached to avoid re-probing every
     T.advance(config.ATTEST_FAIL_TTL_S + 1)
     T.truthy(attest.guard("chute1", "inst-9", PK_B64, "cpk_test"))
     T.truthy(calls > after_first, "re-probed after fail TTL")
+end)
+
+T.test("guard metrics: first verification is ok, repeat is cached", function()
+    attest._reset()
+    attest._set_mode("enforce")
+    local metrics = require("metrics")
+    metrics.reset()
+    attest._deps.fetch = fake_endpoint(function(b64) return T.json.encode({ quote = b64 }) end)
+    T.truthy(attest.guard("chute1", "inst-13", PK_B64, "cpk_test"))
+    T.truthy(attest.guard("chute1", "inst-13", PK_B64, "cpk_test"))
+    local text = metrics.render()
+    T.truthy(text:find('e2ee_attestation_total{result="ok"} 1', 1, true), text)
+    T.truthy(text:find('e2ee_attestation_total{result="cached"} 1', 1, true), text)
 end)
 
 T.test("invalidate drops cached state", function()

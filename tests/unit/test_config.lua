@@ -9,7 +9,7 @@ end
 setenv("ROUTE_MODE", "AGENT")
 setenv("BALANCED_N", "999")          -- clamped to 64
 setenv("UPSTREAM_READ_TIMEOUT_MS", "abc") -- invalid -> default
-setenv("E2EE_ATTEST", "bogus")       -- invalid -> observe
+setenv("E2EE_ATTEST", "bogus")       -- invalid -> enforce (default)
 setenv("ALLOW_NON_CONFIDENTIAL", "yes")
 setenv("API_BASE", "https://mock.example/")
 setenv("E2EE_ATTEST_MRTD", "ABCDEF")
@@ -21,7 +21,7 @@ T.test("parsing, clamping and defaults", function()
     T.eq(config.ROUTE_MODE, "agent")
     T.eq(config.BALANCED_N, 64)
     T.eq(config.UPSTREAM_READ_TIMEOUT_MS, 900000)
-    T.eq(config.ATTEST_MODE, "observe")
+    T.eq(config.ATTEST_MODE, "enforce")
     T.eq(config.ALLOW_NON_CONFIDENTIAL, true)
     T.eq(config.API_BASE, "https://mock.example", "trailing slash stripped")
     T.eq(config.ATTEST_MRTD, "abcdef", "lowercased")
@@ -39,7 +39,7 @@ end)
 T.test("summary has no secrets and mentions the mode", function()
     local s = config.summary()
     T.truthy(s:find("route_mode=agent", 1, true))
-    T.truthy(s:find("attest=observe", 1, true))
+    T.truthy(s:find("attest=enforce", 1, true))
 end)
 
 T.finish("e2ee_config")

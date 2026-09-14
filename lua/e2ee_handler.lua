@@ -147,14 +147,21 @@ local function account_usage_json(model, json_str)
     end
 end
 
-local function account_usage_sse_line(model, line)
+-- Streaming: some backends attach a usage object to every chunk, so the
+-- usage is only accounted once per request, from the last chunk that had one.
+local function usage_from_sse_line(line)
     if type(line) ~= "string" or not line:find('"usage"', 1, true) then
-        return
+        return nil
     end
     local raw = line:match("^data:%s*(.-)%s*$")
-    if raw then
-        account_usage_json(model, raw)
+    if not raw then
+        return nil
     end
+    local obj = cjson.decode(raw)
+    if type(obj) == "table" and type(obj.usage) == "table" then
+        return obj.usage
+    end
+    return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -430,6 +437,7 @@ function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, o
     local first_chunk_at = nil
     local t_stream0 = ngx.now()
     local had_error = false
+    local last_usage = nil
 
     local function deliver(line)
         if not first_chunk_at then
@@ -439,7 +447,7 @@ function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, o
             metrics.observe("e2ee_ttft_seconds", { mode = mode }, ttft)
         end
         metrics.inc("e2ee_stream_chunks_total", nil, 1)
-        account_usage_sse_line(model, line)
+        last_usage = usage_from_sse_line(line) or last_usage
         on_chunk(line)
     end
 
@@ -501,6 +509,10 @@ function _M.e2ee_round_trip(api_key, model, body_json, is_streaming, e2e_path, o
 
     if not done_sent then
         on_chunk(nil)
+    end
+
+    if last_usage then
+        account_usage(model, { usage = last_usage })
     end
 
     if had_error then

@@ -23,17 +23,19 @@
 --   One who can only swap the public key does not. Pin MRTD/RTMRs obtained
 --   from an out-of-band DCAP verification to close most of the remaining gap.
 --
--- UNKNOWNS
---   The endpoint path and the exact report_data preimage have not been
---   confirmed against a live response. The module therefore
---     - probes several candidate URLs (E2EE_ATTEST_URLS to override),
---     - locates the quote structurally (base64/hex string with a valid TDX
---       header) instead of guessing field names,
---     - tries six nonce/pubkey encodings for the binding; a match proves the
---       quote was produced for this nonce and key, so trying several does
---       not weaken the check.
---   In E2EE_ATTEST=observe mode (the shipped default) the response structure
---   is logged so the schema can be confirmed, then switch to enforce.
+-- LIVE SCHEMA (confirmed against api.chutes.ai on 2026-09-14)
+--   GET {api}/chutes/{chute_id}/evidence?nonce={nonce_hex}
+--   -> { "evidence": [ { ..., "quote": <base64 TDX quote v4>, ... }, ... ] }
+--   report_data[0:32] = SHA256(nonce_hex || e2e_pubkey_b64)   (both as the
+--   ASCII strings that travel on the wire)
+--   The evidence array can hold one entry per instance of the chute, so every
+--   quote in the response is tried and the one binding OUR nonce to THIS
+--   instance's key is accepted.
+--
+--   The module still locates quotes structurally (any base64/hex string with
+--   a valid TDX header) and keeps the other URL / encoding candidates as
+--   fallbacks, so a schema change degrades to an observe-mode warning rather
+--   than a silent bypass. E2EE_ATTEST=observe logs the response shape.
 --
 -- CONFIG: see e2ee_config.lua (E2EE_ATTEST*).
 --
@@ -109,9 +111,9 @@ end
 -- Endpoint candidates
 -- ---------------------------------------------------------------------------
 local DEFAULT_URLS = {
-    "{api}/instances/{instance_id}/attestation?nonce={nonce_hex}",
+    "{api}/chutes/{chute_id}/evidence?nonce={nonce_hex}",            -- confirmed live
+    "{api}/instances/{instance_id}/attestation?nonce={nonce_hex}",   -- fallbacks
     "{api}/e2e/instances/{instance_id}/attestation?nonce={nonce_hex}",
-    "{api}/chutes/{chute_id}/evidence?nonce={nonce_hex}",
     "{api}/instances/{instance_id}/evidence?nonce={nonce_hex}",
 }
 
@@ -224,10 +226,14 @@ local function hex_decode(s)
     end))
 end
 
-local function find_quote(node, path, depth)
+local MAX_QUOTES = 32
+
+-- Collect every TDX-looking quote in the document as { raw = bytes, path = "..." }.
+local function find_quotes(node, path, depth, out)
+    out = out or {}
     depth = depth or 0
-    if depth > 8 then
-        return nil
+    if depth > 8 or #out >= MAX_QUOTES then
+        return out
     end
     local t = type(node)
     if t == "string" then
@@ -238,24 +244,22 @@ local function find_quote(node, path, depth)
                 raw = b64decode(std)
             end
             if raw and looks_like_tdx_quote(raw) then
-                return raw, path
+                out[#out + 1] = { raw = raw, path = path }
+                return out
             end
             local hx = hex_decode(node)
             if hx and looks_like_tdx_quote(hx) then
-                return hx, path
+                out[#out + 1] = { raw = hx, path = path }
             end
         end
-        return nil
     elseif t == "table" then
         for k, v in pairs(node) do
-            local q, p = find_quote(v, (path or "") .. "." .. tostring(k), depth + 1)
-            if q then
-                return q, p
-            end
+            find_quotes(v, (path or "") .. "." .. tostring(k), depth + 1, out)
         end
     end
-    return nil
+    return out
 end
+_M._find_quotes = find_quotes
 
 -- Describe a JSON document's shape (keys, types, string lengths) for the
 -- observe-mode log without dumping large blobs.
@@ -291,9 +295,9 @@ end
 -- ---------------------------------------------------------------------------
 local function binding_candidates(nonce_raw, nonce_hex, pk_b64, pk_raw)
     return {
+        { name = "sha256(nonce_hex||pk_b64)", digest = sha256_bin(nonce_hex .. pk_b64) }, -- confirmed live
         { name = "sha256(nonce_raw||pk_raw)", digest = sha256_bin(nonce_raw .. (pk_raw or "")) },
         { name = "sha256(nonce_raw||pk_b64)", digest = sha256_bin(nonce_raw .. pk_b64) },
-        { name = "sha256(nonce_hex||pk_b64)", digest = sha256_bin(nonce_hex .. pk_b64) },
         { name = "sha256(nonce_hex||pk_raw)", digest = sha256_bin(nonce_hex .. (pk_raw or "")) },
         { name = "sha256(pk_raw||nonce_raw)", digest = sha256_bin((pk_raw or "") .. nonce_raw) },
         { name = "sha256(pk_b64||nonce_hex)", digest = sha256_bin(pk_b64 .. nonce_hex) },
@@ -407,8 +411,7 @@ function _M.verify(chute_id, instance_id, e2e_pubkey_b64, api_key)
     -- Cache keyed on the pubkey fingerprint too: a swapped key re-verifies.
     local cached = verified[instance_id]
     if cached and cached.pubkey_fp == fp and now < cached.expires_at then
-        metrics.inc("e2ee_attestation_total", { result = "cached" })
-        return true
+        return true, nil, "cached"
     end
 
     local nonce_raw = random_bytes(32)
@@ -422,16 +425,27 @@ function _M.verify(chute_id, instance_id, e2e_pubkey_b64, api_key)
         return nil, "attestation fetch failed: " .. (ferr or "unknown")
     end
 
-    local quote_bin, where = find_quote(data, "", 0)
-    if not quote_bin then
+    local quotes = find_quotes(data, "", 0)
+    if #quotes == 0 then
         return nil, "no TDX quote found in attestation response from " .. url
             .. "; response shape: " .. describe(data)
             .. " (point E2EE_ATTEST_URLS at the right endpoint if needed)"
     end
 
-    local ok, err, details = _M.check_quote(quote_bin, nonce_raw, e2e_pubkey_b64)
-    if not ok then
-        return nil, err .. " [quote at " .. where .. " from " .. url .. "]"
+    -- The evidence endpoint is per chute and may carry one quote per instance:
+    -- accept the first quote that binds our nonce to this instance's key.
+    local details, where, last_err
+    for _, q in ipairs(quotes) do
+        local ok, err, d = _M.check_quote(q.raw, nonce_raw, e2e_pubkey_b64)
+        if ok then
+            details, where = d, q.path
+            break
+        end
+        last_err = err .. " [quote at " .. q.path .. "]"
+    end
+    if not details then
+        return nil, "none of " .. #quotes .. " quote(s) from " .. url
+            .. " passed: " .. (last_err or "unknown")
     end
 
     verified[instance_id] = { pubkey_fp = fp, expires_at = now + config.ATTEST_TTL_S }
@@ -464,9 +478,9 @@ function _M.guard(chute_id, instance_id, e2e_pubkey_b64, api_key)
         end
     end
 
-    local ok, err = _M.verify(chute_id, instance_id, e2e_pubkey_b64, api_key)
+    local ok, err, how = _M.verify(chute_id, instance_id, e2e_pubkey_b64, api_key)
     if ok then
-        metrics.inc("e2ee_attestation_total", { result = "ok" })
+        metrics.inc("e2ee_attestation_total", { result = how == "cached" and "cached" or "ok" })
         return true
     end
 

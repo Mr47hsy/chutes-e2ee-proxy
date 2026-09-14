@@ -168,7 +168,7 @@ fi
 # Banner
 # ---------------------------------------------------------------------------
 log "user=$(id -un 2>/dev/null || id -u) tls=$TLS_MODE server_name=$SERVER_NAME log_level=$LOG_LEVEL max_body=$MAX_BODY_SIZE"
-log "route_mode=${ROUTE_MODE:-balanced} attestation=${E2EE_ATTEST:-observe} api_base=${API_BASE:-https://api.chutes.ai} models_base=$MODELS_BASE resolvers='$RESOLVERS'"
+log "route_mode=${ROUTE_MODE:-balanced} attestation=${E2EE_ATTEST:-enforce} api_base=${API_BASE:-https://api.chutes.ai} models_base=$MODELS_BASE resolvers='$RESOLVERS'"
 if [ "$ALLOW_PLAINTEXT" = true ]; then
     cat >&2 <<EOF
 [entrypoint] ******************************************************************
@@ -179,9 +179,10 @@ if [ "$ALLOW_PLAINTEXT" = true ]; then
 [entrypoint] ******************************************************************
 EOF
 fi
-if [ "${E2EE_ATTEST:-observe}" = "observe" ]; then
-    warn "E2EE_ATTEST=observe: attestation results are logged but not enforced (see README)."
-fi
+case "${E2EE_ATTEST:-enforce}" in
+    observe) warn "E2EE_ATTEST=observe: attestation results are logged but not enforced (see README)." ;;
+    off)     warn "E2EE_ATTEST=off: instance keys are trusted without attestation." ;;
+esac
 
 NGINX_ARGS=(-p "$OPENRESTY_PREFIX" -c "$RUNTIME_DIR/nginx.conf" -e /dev/stderr)
 

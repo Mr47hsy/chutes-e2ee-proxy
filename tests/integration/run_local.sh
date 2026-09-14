@@ -50,10 +50,10 @@ COMMON=(--add-host=host.docker.internal:host-gateway
         -e LOG_LEVEL=info)
 
 echo "=== proxies ($IMAGE) ==="
-docker run -d --name proxy-observe -p 8443:443 "${COMMON[@]}" "$IMAGE" >/dev/null
+docker run -d --name proxy-observe -p 8443:443 "${COMMON[@]}" -e E2EE_ATTEST=observe "$IMAGE" >/dev/null
 docker run -d --name proxy-enforce -p 8444:443 "${COMMON[@]}" \
     -e E2EE_ATTEST=enforce -e E2EE_ATTEST_TTL=1 -e E2EE_ATTEST_FAIL_TTL=0 "$IMAGE" >/dev/null
-docker run -d --name proxy-small -p 8445:443 "${COMMON[@]}" -e MAX_BODY_SIZE=1m "$IMAGE" >/dev/null
+docker run -d --name proxy-small -p 8445:443 "${COMMON[@]}" -e E2EE_ATTEST=observe -e MAX_BODY_SIZE=1m "$IMAGE" >/dev/null
 
 for p in 8443 8444 8445; do
     ok=0

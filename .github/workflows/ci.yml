@@ -79,10 +79,10 @@ jobs:
                   -e API_BASE=http://host.docker.internal:9100 \
                   -e MODELS_BASE=http://host.docker.internal:9100 \
                   -e LOG_LEVEL=info"
-          docker run -d --name proxy-observe -p 8443:443 $COMMON e2ee-proxy:ci
+          docker run -d --name proxy-observe -p 8443:443 $COMMON -e E2EE_ATTEST=observe e2ee-proxy:ci
           docker run -d --name proxy-enforce -p 8444:443 $COMMON \
             -e E2EE_ATTEST=enforce -e E2EE_ATTEST_TTL=1 -e E2EE_ATTEST_FAIL_TTL=0 e2ee-proxy:ci
-          docker run -d --name proxy-small -p 8445:443 $COMMON -e MAX_BODY_SIZE=1m e2ee-proxy:ci
+          docker run -d --name proxy-small -p 8445:443 $COMMON -e E2EE_ATTEST=observe -e MAX_BODY_SIZE=1m e2ee-proxy:ci
           for p in 8443 8444 8445; do
             for i in $(seq 1 30); do curl -skf https://127.0.0.1:$p/health >/dev/null && break; sleep 1; done
             curl -skf https://127.0.0.1:$p/health

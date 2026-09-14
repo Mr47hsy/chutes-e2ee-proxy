@@ -42,7 +42,7 @@ Client (OpenAI SDK / Anthropic SDK / curl)
 ./build.sh                      # -> image e2ee-proxy
 ./build.sh --debian             # same, on the Debian bookworm base (glibc)
 
-# run: self-signed TLS, balanced routing, attestation in observe mode
+# run: self-signed TLS, balanced routing, attestation enforced
 docker run --rm -p 8443:443 e2ee-proxy
 ```
 
@@ -164,23 +164,26 @@ who controls the API *and* can forge quotes still wins; one who can only swap
 the public key does not. Pinning measurements obtained from an out-of-band
 DCAP verification closes most of the remaining gap.
 
-The exact endpoint path and `report_data` preimage of the Chutes attestation
-API have not been confirmed against a live response yet, so:
+Confirmed against the live API (2026-09-14): the evidence endpoint is
+`GET /chutes/{chute_id}/evidence?nonce=<32 bytes hex>`, the response carries
+an `evidence` array with a base64 TDX quote (v4) per entry, and
+`report_data[0:32] = SHA256(nonce_hex ‖ e2e_pubkey_base64)`. Because the
+array can hold one quote per instance, every quote is tried and the one that
+binds our nonce to the chosen instance's key is accepted.
 
-- `E2EE_ATTEST=observe` (shipped default) runs every check, logs
-  `attestation OK …` or `ATTESTATION FAILED (observe mode, request allowed)`
-  with the response shape, and never rejects. Failures are cached for
-  `E2EE_ATTEST_FAIL_TTL` (300 s) so they do not add round trips to every
-  request.
-- Once the logs show `attestation OK`, set `E2EE_ATTEST=enforce`. Instances
-  that fail are rejected (up to three are tried) and the request returns
-  `502 TEE attestation failed`.
-- If the observe logs show a different endpoint or field layout, set
-  `E2EE_ATTEST_URLS` (comma-separated templates with `{api}`, `{chute_id}`,
-  `{instance_id}`, `{nonce_hex}`). The quote is located structurally inside
-  the JSON, so field names do not matter, and six nonce/pubkey encodings are
-  tried for the binding; a match proves the quote was made for this nonce and
-  key, so trying several does not weaken the check.
+- `E2EE_ATTEST=enforce` (default): instances that fail are rejected (up to
+  three are tried per request) and the request returns
+  `502 TEE attestation failed`. Verifications are cached per instance key
+  for `E2EE_ATTEST_TTL` (600 s).
+- `E2EE_ATTEST=observe`: runs every check, logs `attestation OK …` or
+  `ATTESTATION FAILED (observe mode, request allowed)` with the response
+  shape, never rejects; failures are cached for `E2EE_ATTEST_FAIL_TTL`
+  (300 s). Use it when investigating a schema change.
+- `E2EE_ATTEST_URLS` overrides the endpoint candidates (templates with
+  `{api}`, `{chute_id}`, `{instance_id}`, `{nonce_hex}`); the quote is
+  located structurally so field names do not matter, and several
+  nonce/pubkey encodings are tried for the binding (a match proves the quote
+  was made for this nonce and key, so trying several does not weaken it).
 - `E2EE_ATTEST=off` disables it.
 
 Also note that `confidential_compute` in `/v1/models` is self-reported by the
@@ -218,7 +221,7 @@ API; attestation is what actually ties the key to a TD.
 | `ROUTE_BAN_S` | `60` | seconds an instance is avoided after a failure |
 | `PIN_INSTANCE_ID` | – | diagnostics: force one instance |
 | `PERF_EWMA_ALPHA`, `PERF_HALF_LIFE_S`, `PERF_COLD_START_S` | `0.3`, `300`, `0.5` | performance-mode scoring |
-| `E2EE_ATTEST` | `observe` | `enforce`, `observe`, `off` |
+| `E2EE_ATTEST` | `enforce` | `enforce`, `observe`, `off` |
 | `E2EE_ATTEST_MRTD`, `E2EE_ATTEST_RTMR0..3` | – | hex allowlist (empty = accept any) |
 | `E2EE_ATTEST_TTL` / `E2EE_ATTEST_FAIL_TTL` | `600` / `300` | cache of successful / observed-failed verifications (s) |
 | `E2EE_ATTEST_URLS` | built-in candidates | endpoint templates |
@@ -348,7 +351,6 @@ appears in the logs.
 
 - Attestation signature and PCK chain are not verified (DCAP QVL sidecar or
   an in-`.so` verifier would close this).
-- Attestation endpoint/schema are unconfirmed; ships in observe mode.
 - Nonce batches are fetched synchronously when they expire (about one extra
   round trip when requests are more than ~55 s apart); background prefetch
   is a possible follow-up.

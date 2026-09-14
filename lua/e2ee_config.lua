@@ -110,11 +110,10 @@ _M.ALLOW_NON_CONFIDENTIAL = env_bool("ALLOW_NON_CONFIDENTIAL", false)
 -- ---------------------------------------------------------------------------
 -- Attestation
 -- ---------------------------------------------------------------------------
--- The endpoint path and report_data preimage of the Chutes attestation API
--- have not been confirmed against a live response yet, so the shipped
--- default is "observe": every check runs and is logged, nothing is rejected.
--- Flip to "enforce" once observe logs show "attestation OK".
-_M.ATTEST_MODE = env_enum("E2EE_ATTEST", "observe", { "enforce", "observe", "off" })
+-- Endpoint and report_data preimage were confirmed against api.chutes.ai on
+-- 2026-09-14 (see e2ee_attest.lua), so the default is "enforce". Use
+-- "observe" to log without rejecting when investigating a schema change.
+_M.ATTEST_MODE = env_enum("E2EE_ATTEST", "enforce", { "enforce", "observe", "off" })
 _M.ATTEST_TTL_S = env_num("E2EE_ATTEST_TTL", 600, 1, 86400)
 _M.ATTEST_FAIL_TTL_S = env_num("E2EE_ATTEST_FAIL_TTL", 300, 0, 86400)
 _M.ATTEST_TIMEOUT_MS = env_num("E2EE_ATTEST_TIMEOUT_MS", 10000, 500, 120000)

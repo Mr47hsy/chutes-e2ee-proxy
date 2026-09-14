@@ -63,6 +63,33 @@ echo "$stream" | grep -q '"e2e"' && fail "encrypted chunk leaked to client"
 echo "chunks=$n_chunks"
 echo "$stream" | grep '^data: {' | sed 's/^data: //' | grep -o '"content":"[^"]*"' | tr -d '\n' | head -c 300; echo
 
+step "attestation evidence shape (GET /chutes/{chute_id}/evidence, strings truncated)"
+API_BASE="${API_BASE:-https://api.chutes.ai}"
+chute_id=$(echo "$models" | python3 -c "
+import sys, json
+for m in json.load(sys.stdin)['data']:
+    if m['id'] == '$MODEL':
+        print(m.get('chute_id', '')); break")
+if [ -n "$chute_id" ]; then
+    nonce_hex=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    "${CURL[@]}" "$API_BASE/chutes/$chute_id/evidence?nonce=$nonce_hex" | python3 -c "
+import sys, json
+def shape(v, d=0):
+    if isinstance(v, dict):
+        return '{' + ', '.join(f'{k}: {shape(x, d+1)}' for k, x in list(v.items())[:30]) + '}'
+    if isinstance(v, list):
+        return f'[{len(v)} items' + (': ' + shape(v[0], d+1) if v else '') + ']'
+    if isinstance(v, str):
+        return repr(v) if len(v) <= 48 else f'str[{len(v)}]'
+    return repr(v)
+try:
+    print(shape(json.load(sys.stdin)))
+except Exception as e:
+    print('non-JSON or empty evidence response:', e)"
+else
+    echo "(chute_id for $MODEL not found in model list)"
+fi
+
 step "proxy metrics (attestation / cache / errors)"
 curl -sk --max-time 10 "$PROXY_URL/metrics" | grep -E '^e2ee_(attestation_total|upstream_errors_total|cache_events_total|requests_total|instance_picks_total)' || true
 
