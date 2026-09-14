@@ -54,7 +54,7 @@ local function to_pattern(entry)
 end
 
 local function compile(list_str)
-    local out = {}
+    local out
     allow_any = false
     local src = list_str
     if not src or src == "" then

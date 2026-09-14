@@ -68,9 +68,7 @@ local function without_banned(cs, cands)
     local out = {}
     for _, inst in ipairs(cands) do
         local until_ts = cs.banned[inst.instance_id]
-        if until_ts and until_ts > t then
-            -- still banned
-        else
+        if not until_ts or until_ts <= t then
             cs.banned[inst.instance_id] = nil
             out[#out + 1] = inst
         end
