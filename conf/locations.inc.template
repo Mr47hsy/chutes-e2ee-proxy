@@ -1,0 +1,82 @@
+# =============================================================================
+# locations.inc.template - shared by the :443 and (optionally) :80 servers.
+# Rendered by entrypoint.sh; placeholders:
+#   __MAX_BODY_SIZE__   MAX_BODY_SIZE (default 64m)
+#   __MODELS_BASE__     MODELS_BASE (default https://llm.chutes.ai)
+#   __MODELS_HOST__     host part of MODELS_BASE
+# =============================================================================
+
+set $e2ee_request_id "";
+
+# 1M-token requests are ~4MB; base64 images push well past 10m.
+client_max_body_size __MAX_BODY_SIZE__;
+client_body_buffer_size 1m;
+
+# Structured JSON instead of nginx's HTML 413 page.
+error_page 413 = @e2ee_413;
+location @e2ee_413 {
+    default_type application/json;
+    return 413 '{"error":{"message":"request body too large (limit __MAX_BODY_SIZE__; raise MAX_BODY_SIZE)","type":"proxy_error"}}';
+}
+
+# Request id + CORS preflight (204) for every location below.
+access_by_lua_block {
+    require("proxy_common").access()
+}
+
+# CORS allowlist + X-Request-Id on every response, including proxied ones.
+header_filter_by_lua_block {
+    require("proxy_common").header_filter()
+}
+
+location = /health {
+    content_by_lua_block {
+        require("proxy_common").health()
+    }
+}
+
+# Prometheus text format. METRICS_ENABLED=false turns it into a 404.
+location = /metrics {
+    content_by_lua_block {
+        require("metrics").handler()
+    }
+}
+
+# /v1/models - plain passthrough (TLS only, NOT end-to-end encrypted).
+# The model list is public metadata; the Authorization header is forwarded.
+location = /v1/models {
+    proxy_pass __MODELS_BASE__/v1/models;
+    proxy_ssl_server_name on;
+    proxy_set_header Host __MODELS_HOST__;
+    proxy_set_header Authorization $http_authorization;
+    proxy_pass_request_headers on;
+    proxy_hide_header Access-Control-Allow-Origin;
+    proxy_hide_header Access-Control-Allow-Headers;
+    proxy_hide_header Access-Control-Allow-Methods;
+}
+
+# Claude Messages API
+location = /v1/messages {
+    content_by_lua_block {
+        require("claude_handler").handle()
+    }
+}
+
+# OpenAI Responses API
+location = /v1/responses {
+    content_by_lua_block {
+        require("responses_handler").handle()
+    }
+}
+
+# E2EE proxy for every other /v1/* path (chat/completions, completions, ...)
+location /v1/ {
+    content_by_lua_block {
+        require("e2ee_handler").handle()
+    }
+}
+
+location / {
+    default_type application/json;
+    return 404 '{"error":{"message":"use /v1/ endpoints","type":"proxy_error"}}';
+}

@@ -1,0 +1,126 @@
+# =============================================================================
+# nginx.conf.template - rendered by entrypoint.sh into $RUNTIME_DIR/nginx.conf
+#
+# Placeholders (all substituted by entrypoint.sh):
+#   __RUNTIME_DIR__       writable directory for pid/temp files (default /tmp/e2ee)
+#   __RESOLVERS__         DNS resolvers from /etc/resolv.conf
+#   __SERVER_NAME__       TLS_DOMAIN or "_"
+#   __LOG_LEVEL__         LOG_LEVEL (debug|info|notice|warn|error), default notice
+#   __PLAINTEXT_LISTEN__  listen address for the :80 server
+#   __PLAINTEXT_BODY__    either a 301 redirect or the shared locations include
+# =============================================================================
+
+# Module-level Lua state (nonce cache, instance selector, metrics, attestation
+# cache) assumes exactly one worker. Moving to >1 workers requires migrating
+# that state to lua_shared_dict with atomic operations: nonces are single-use,
+# and two workers sharing a batch would double-spend them (403s).
+worker_processes 1;
+
+# Default is "notice" so per-request details stay out of the log. Set
+# LOG_LEVEL=debug for instance/nonce-prefix traces. API keys are never logged.
+error_log /dev/stderr __LOG_LEVEL__;
+pid __RUNTIME_DIR__/nginx.pid;
+
+# Every variable read by lua/e2ee_config.lua must be exported here.
+env API_BASE;
+env MODELS_BASE;
+env ROUTE_MODE;
+env BALANCED_N;
+env PIN_INSTANCE_ID;
+env PERF_EWMA_ALPHA;
+env PERF_HALF_LIFE_S;
+env PERF_COLD_START_S;
+env ROUTE_BAN_S;
+env UPSTREAM_CONNECT_TIMEOUT_MS;
+env UPSTREAM_SEND_TIMEOUT_MS;
+env UPSTREAM_READ_TIMEOUT_MS;
+env DISCOVERY_TIMEOUT_MS;
+env MODELS_TIMEOUT_MS;
+env MODEL_MAP_TTL_S;
+env ALLOW_NON_CONFIDENTIAL;
+env E2EE_ATTEST;
+env E2EE_ATTEST_TTL;
+env E2EE_ATTEST_FAIL_TTL;
+env E2EE_ATTEST_TIMEOUT_MS;
+env E2EE_ATTEST_ALLOW_DEBUG_TD;
+env E2EE_ATTEST_MRTD;
+env E2EE_ATTEST_RTMR0;
+env E2EE_ATTEST_RTMR1;
+env E2EE_ATTEST_RTMR2;
+env E2EE_ATTEST_RTMR3;
+env E2EE_ATTEST_URLS;
+env CORS_ALLOWED_ORIGINS;
+env METRICS_ENABLED;
+env ALLOW_PLAINTEXT;
+env E2EE_LIB_PATH;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    resolver __RESOLVERS__ valid=60s ipv6=off;
+    resolver_timeout 5s;
+
+    lua_package_path "/usr/local/openresty/lua/?.lua;;";
+
+    # Trust system CA certs for outbound cosocket TLS (api.chutes.ai)
+    lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+    lua_ssl_verify_depth 5;
+
+    # Reserved for a future multi-worker migration of the module-level caches.
+    lua_shared_dict e2ee_cache 10m;
+
+    # All writable paths live under the runtime dir so the process can run
+    # as an unprivileged user.
+    client_body_temp_path __RUNTIME_DIR__/client_body;
+    proxy_temp_path       __RUNTIME_DIR__/proxy;
+    fastcgi_temp_path     __RUNTIME_DIR__/fastcgi;
+    uwsgi_temp_path       __RUNTIME_DIR__/uwsgi;
+    scgi_temp_path        __RUNTIME_DIR__/scgi;
+
+    server_tokens off;
+
+    # Request id ($e2ee_request_id is set in proxy_common.access) and the
+    # instance that served the request travel through every log line.
+    log_format e2ee '$remote_addr [$time_local] "$request" $status $body_bytes_sent '
+                    'rt=$request_time rid=$e2ee_request_id '
+                    'inst="$sent_http_x_e2ee_instance_id" mode="$sent_http_x_e2ee_route_mode"';
+    access_log /dev/stdout e2ee;
+
+    init_worker_by_lua_block {
+        require("proxy_common").init_worker()
+    }
+
+    # ------------------------------------------------------------------
+    # HTTPS (primary)
+    # ------------------------------------------------------------------
+    server {
+        listen 443 ssl;
+        server_name __SERVER_NAME__;
+
+        # Written by entrypoint.sh: custom cert (TLS_CERT/TLS_KEY[/TLS_CA])
+        # or a self-signed cert generated at startup.
+        ssl_certificate     __RUNTIME_DIR__/ssl.crt;
+        ssl_certificate_key __RUNTIME_DIR__/ssl.key;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:e2ee_ssl:1m;
+        ssl_session_timeout 10m;
+
+        include __RUNTIME_DIR__/locations.inc;
+    }
+
+    # ------------------------------------------------------------------
+    # Plaintext HTTP: redirect by default; serves the API when
+    # ALLOW_PLAINTEXT=true (API keys then travel unencrypted on this hop).
+    # ------------------------------------------------------------------
+    server {
+        listen __PLAINTEXT_LISTEN__;
+        server_name __SERVER_NAME__;
+        set $e2ee_request_id "";
+        __PLAINTEXT_BODY__
+    }
+}
