@@ -54,13 +54,13 @@ public DNS name that resolves to `127.0.0.1`), so either host name works:
 from openai import OpenAI
 client = OpenAI(api_key="cpk_...", base_url="https://localhost:8443/v1")
 resp = client.chat.completions.create(
-    model="deepseek-ai/DeepSeek-V3.1-TEE",
+    model="Qwen/Qwen3-32B-TEE",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 
 import anthropic
 client = anthropic.Anthropic(api_key="cpk_...", base_url="https://localhost:8443")
-resp = client.messages.create(model="deepseek-ai/DeepSeek-V3.1-TEE", max_tokens=128,
+resp = client.messages.create(model="Qwen/Qwen3-32B-TEE", max_tokens=128,
                               messages=[{"role": "user", "content": "Hello!"}])
 ```
 
@@ -82,7 +82,7 @@ is a real request:
 ```bash
 curl -sk https://localhost:8443/v1/chat/completions \
   -H "Authorization: Bearer cpk_..." -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-ai/DeepSeek-V3.1-TEE","messages":[{"role":"user","content":"ping"}]}'
+  -d '{"model":"Qwen/Qwen3-32B-TEE","messages":[{"role":"user","content":"ping"}]}'
 ```
 
 - A normal completion: the variant is right, done.
@@ -99,7 +99,7 @@ key from `CHUTES_API_KEY` without echoing it:
 
 ```bash
 docker run -d --name e2ee-proxy -p 8443:443 e2ee-proxy
-CHUTES_API_KEY=cpk_... tests/e2e_real.sh
+CHUTES_API_KEY=cpk_... tests/e2e_real.sh            # MODEL=... to pick another TEE model
 ```
 
 ## TLS

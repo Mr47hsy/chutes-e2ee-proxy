@@ -9,7 +9,7 @@ import os
 import anthropic
 
 API_KEY = os.environ["CHUTES_API_KEY"]
-MODEL = "deepseek-ai/DeepSeek-V3.1-TEE"
+MODEL = os.environ.get("CHUTES_MODEL", "Qwen/Qwen3-32B-TEE")
 BASE_URL = "https://e2ee-local-proxy.chutes.dev:8443"
 
 client = anthropic.Anthropic(

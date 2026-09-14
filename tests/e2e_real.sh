@@ -13,7 +13,8 @@ set -euo pipefail
 
 : "${CHUTES_API_KEY:?set CHUTES_API_KEY (cpk_...)}"
 PROXY_URL="${PROXY_URL:-https://127.0.0.1:8443}"
-MODEL="${MODEL:-deepseek-ai/DeepSeek-V3.1-TEE}"
+# Cheapest plain-instruct TEE model at the time of writing; override with MODEL=...
+MODEL="${MODEL:-unsloth/Mistral-Nemo-Instruct-2407-TEE}"
 CURL=(curl -sk --max-time 180 -H "Authorization: Bearer $CHUTES_API_KEY" -H "Content-Type: application/json")
 
 step() { printf '\n=== %s ===\n' "$*"; }
@@ -25,7 +26,11 @@ echo "$health"
 
 step "GET /v1/models (TLS passthrough, not E2EE) contains $MODEL"
 models=$("${CURL[@]}" "$PROXY_URL/v1/models")
-echo "$models" | grep -q "\"$MODEL\"" || { echo "$models" | head -c 400; echo; fail "model not listed (key valid? model name?)"; }
+if ! echo "$models" | grep -q "\"id\":\"$MODEL\""; then
+    echo "available TEE models:"
+    echo "$models" | grep -o '"id":"[^"]*-TEE"' | sed 's/"id":"//; s/"$//' | sort | sed 's/^/  /'
+    fail "model '$MODEL' not listed; pick one above with MODEL=..."
+fi
 echo "ok"
 
 step "non-streaming chat completion (E2EE)"
