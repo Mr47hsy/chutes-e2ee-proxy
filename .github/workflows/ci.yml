@@ -1,0 +1,122 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LuaJIT + luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit lua-check
+
+      - name: LuaJIT syntax check (luajit -bl)
+        run: |
+          set -e
+          for f in lua/*.lua lua/resty/*.lua tests/unit/*.lua tests/*.lua; do
+            luajit -bl "$f" >/dev/null
+          done
+          echo "all Lua files compile under LuaJIT"
+
+      - name: luacheck
+        run: luacheck lua tests --no-color
+
+      - name: Unit tests (pure Lua, ngx mocked)
+        run: tests/unit/run.sh
+
+  native:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libe2ee_proxy.so and run crypto self-tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev binutils
+          cd native && CC=gcc ./build.sh --selftest
+
+  image:
+    runs-on: ubuntu-22.04
+    needs: [lint-and-unit, native]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (linux/amd64)
+        run: docker build --platform linux/amd64 -t e2ee-proxy:ci .
+
+      - name: Lua test needing the real .so (resty CLI from the alpine-fat image)
+        run: |
+          cid=$(docker create e2ee-proxy:ci)
+          docker cp "$cid:/usr/local/openresty/lib/libe2ee_proxy.so" ./libe2ee_proxy.so
+          docker rm "$cid" >/dev/null
+          docker run --rm --entrypoint /usr/local/openresty/bin/resty \
+            -v "$PWD/libe2ee_proxy.so:/usr/local/openresty/lib/libe2ee_proxy.so:ro" \
+            -v "$PWD/tests:/tests:ro" -v "$PWD/lua:/workspace/lua:ro" \
+            openresty/openresty:1.31.1.1-alpine-fat /tests/test_json_array_roundtrip.lua
+
+      - name: Set up Python for the mock upstream
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/integration/requirements.txt
+
+      - name: Start mock upstream
+        run: |
+          nohup python3 tests/integration/mock_upstream.py --port 9100 > mock.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:9100/_mock/stats >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:9100/_mock/stats
+
+      - name: Start proxies (observe / enforce / small-body)
+        run: |
+          COMMON="--add-host=host.docker.internal:host-gateway \
+                  -e API_BASE=http://host.docker.internal:9100 \
+                  -e MODELS_BASE=http://host.docker.internal:9100 \
+                  -e LOG_LEVEL=info"
+          docker run -d --name proxy-observe -p 8443:443 $COMMON e2ee-proxy:ci
+          docker run -d --name proxy-enforce -p 8444:443 $COMMON \
+            -e E2EE_ATTEST=enforce -e E2EE_ATTEST_TTL=1 -e E2EE_ATTEST_FAIL_TTL=0 e2ee-proxy:ci
+          docker run -d --name proxy-small -p 8445:443 $COMMON -e MAX_BODY_SIZE=1m e2ee-proxy:ci
+          for p in 8443 8444 8445; do
+            for i in $(seq 1 30); do curl -skf https://127.0.0.1:$p/health >/dev/null && break; sleep 1; done
+            curl -skf https://127.0.0.1:$p/health
+          done
+
+      - name: Integration tests
+        env:
+          PROXY_URL: https://127.0.0.1:8443
+          PROXY_ENFORCE_URL: https://127.0.0.1:8444
+          PROXY_SMALL_BODY_URL: https://127.0.0.1:8445
+          MOCK_URL: http://127.0.0.1:9100
+        run: pytest -q tests/integration/test_proxy.py
+
+      - name: Logs must not contain API key material
+        if: always()
+        run: |
+          docker logs proxy-observe 2>&1 | tee observe.log | grep -c . >/dev/null
+          ! grep -q "cpk_integration" observe.log || { echo "API key leaked into logs"; exit 1; }
+          echo "no API key material in logs"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "=== mock ==="; cat mock.log || true
+          for n in proxy-observe proxy-enforce proxy-small; do echo "=== $n ==="; docker logs $n 2>&1 | tail -200; done
+
+  image-debian:
+    runs-on: ubuntu-22.04
+    needs: [lint-and-unit, native]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Debian variant and check it starts
+        run: |
+          docker build --platform linux/amd64 -f Dockerfile.debian -t e2ee-proxy:debian .
+          docker run -d --name proxy-debian -p 8446:443 e2ee-proxy:debian
+          for i in $(seq 1 30); do curl -skf https://127.0.0.1:8446/health >/dev/null && break; sleep 1; done
+          curl -skf https://127.0.0.1:8446/health
