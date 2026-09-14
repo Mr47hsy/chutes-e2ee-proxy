@@ -1,0 +1,122 @@
+# Publish images to GitHub Container Registry (ghcr.io) on release tags.
+#
+#   git tag release-1.0.0 && git push origin release-1.0.0
+#
+# produces
+#   ghcr.io/<owner>/chutes-e2ee-proxy:1.0.0            (Debian, default Dockerfile)
+#   ghcr.io/<owner>/chutes-e2ee-proxy:latest
+#   ghcr.io/<owner>/chutes-e2ee-proxy:sha-<short>
+#   ghcr.io/<owner>/chutes-e2ee-proxy:1.0.0-alpine     (Dockerfile.alpine)
+#   ghcr.io/<owner>/chutes-e2ee-proxy:latest-alpine
+#
+# Gates before anything is pushed: lint + unit tests + native self-test, then
+# the freshly built image must pass the integration suite on the runner.
+# The first push creates a *private* package; make it public once in the
+# package settings if anonymous pulls are wanted.
+
+name: publish
+
+on:
+  push:
+    tags: ["release-*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT, luacheck and the native toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends luajit lua-check gcc libc6-dev libssl-dev zlib1g-dev binutils
+      - name: LuaJIT syntax check + luacheck + unit tests
+        run: |
+          for f in lua/*.lua lua/resty/*.lua tests/unit/*.lua tests/*.lua; do luajit -bl "$f" >/dev/null; done
+          luacheck lua tests --no-color
+          tests/unit/run.sh
+      - name: Native self-test
+        run: cd native && CC=gcc ./build.sh --selftest
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            suffix: ""
+            name: debian
+          - dockerfile: Dockerfile.alpine
+            suffix: "-alpine"
+            name: alpine
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (ghcr requires lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=true
+            suffix=${{ matrix.suffix }},onlatest=true
+          tags: |
+            type=match,pattern=release-(.*),group=1
+            type=sha,prefix=sha-
+
+      # 1. Build into the local Docker engine (the Dockerfile itself runs the
+      #    crypto self-test and `nginx -t`), nothing is pushed yet.
+      - name: Build (${{ matrix.name }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          build-args: PLATFORM=linux/amd64
+          load: true
+          tags: e2ee-proxy:candidate
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # 2. The candidate must pass the integration suite before it is published.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Integration tests against the candidate image
+        run: |
+          pip install -r tests/integration/requirements.txt
+          IMAGE=e2ee-proxy:candidate tests/integration/run_local.sh
+
+      # 3. Push (layers are cached, so this only uploads).
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push (${{ matrix.name }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          build-args: PLATFORM=linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          provenance: false   # avoids the "unknown/unknown" attestation entry in the Packages UI
+
+      - name: Published tags
+        run: echo "${{ steps.meta.outputs.tags }}"
