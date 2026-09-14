@@ -22,3 +22,9 @@ certs/
 *.der
 libe2ee_proxy*.so
 xvmp/
+
+private/
+
+# native build output
+native/out/
+.DS_Store

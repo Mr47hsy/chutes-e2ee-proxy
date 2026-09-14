@@ -1,50 +1,46 @@
 --
--- e2ee_discovery.lua - Model resolution and nonce management
+-- e2ee_discovery.lua - model resolution and nonce management.
 --
--- Mirrors the Python transport's DiscoveryManager:
---   - resolve_chute_id(model) -> chute_id
---   - get_nonce(chute_id)     -> instance_info, nonce
+--   resolve_chute_id(model, api_key)     -> chute_id
+--   get_nonce(chute_id, api_key, mode)   -> instance_info, nonce, pick_reason
+--   invalidate_nonces(chute_id, instance_id)
 --
--- Uses ngx.shared.DICT for caching (shared across requests in single worker).
--- Uses lua-resty-http for upstream API calls.
+-- Instance choice is delegated to instance_selector; this module only owns
+-- the nonce batches and the HTTP calls.
+--
+-- State is module-level (single worker, see nginx.conf.template).
 --
 
 local http = require("resty.http")
 local cjson = require("cjson.safe")
+local config = require("e2ee_config")
+local log = require("e2ee_log")
+local metrics = require("metrics")
+local selector = require("instance_selector")
 
 local _M = {}
 
--- Cache (module-level, single worker)
+-- model_map[model_id] = { chute_id = ..., confidential = bool }
 local model_map = nil
 local model_map_expires = 0
-local MODEL_MAP_TTL = 300  -- 5 minutes
 
--- Nonce cache: { [chute_id] = { instances = [...], expires_at = N } }
+-- nonce_cache[chute_id] = { instances = [...], expires_at = ts }
 local nonce_cache = {}
-
-local API_BASE = "https://api.chutes.ai"
-local MODELS_BASE = "https://llm.chutes.ai"
-
-function _M.set_api_base(base)
-    API_BASE = base
-end
-
-function _M.set_models_base(base)
-    MODELS_BASE = base
-end
 
 --- Check if a string looks like a UUID
 local function is_uuid(s)
-    if not s or #s ~= 36 then return false end
+    if not s or #s ~= 36 then
+        return false
+    end
     return s:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
 end
 
---- Fetch models list from API
+--- Fetch the model list from the API
 local function fetch_model_map(api_key)
     local httpc = http.new()
-    httpc:set_timeout(10000)
+    httpc:set_timeout(config.MODELS_TIMEOUT_MS)
 
-    local res, err = httpc:request_uri(MODELS_BASE .. "/v1/models", {
+    local res, err = httpc:request_uri(config.MODELS_BASE .. "/v1/models", {
         method = "GET",
         headers = {
             ["Authorization"] = "Bearer " .. api_key,
@@ -55,7 +51,6 @@ local function fetch_model_map(api_key)
     if not res then
         return nil, "model list request failed: " .. (err or "unknown")
     end
-
     if res.status ~= 200 then
         return nil, "model list returned " .. res.status
     end
@@ -74,19 +69,14 @@ local function fetch_model_map(api_key)
             }
         end
     end
-
     return map
 end
 
-local allow_non_confidential = os.getenv("ALLOW_NON_CONFIDENTIAL") == "true"
-
---- Resolve a model name to a chute_id
--- @param model    Model name or UUID
--- @param api_key  API key for authentication
--- @return chute_id string
 local function check_confidential(model, entry)
-    if not entry then return nil, "model '" .. model .. "' not found" end
-    if not entry.confidential and not allow_non_confidential then
+    if not entry then
+        return nil, "model '" .. model .. "' not found"
+    end
+    if not entry.confidential and not config.ALLOW_NON_CONFIDENTIAL then
         return nil, "model '" .. model .. "' is not running in confidential compute (TEE). "
             .. "E2EE requires confidential compute to guarantee privacy. "
             .. "Set ALLOW_NON_CONFIDENTIAL=true to override."
@@ -94,14 +84,13 @@ local function check_confidential(model, entry)
     return entry.chute_id
 end
 
+--- Resolve a model name (or UUID) to a chute_id
 function _M.resolve_chute_id(model, api_key)
     if is_uuid(model) then
         return model
     end
 
     local now = ngx.now()
-
-    -- Check cache
     if model_map and now < model_map_expires then
         local entry = model_map[model]
         if entry then
@@ -109,32 +98,27 @@ function _M.resolve_chute_id(model, api_key)
         end
     end
 
-    -- Fetch fresh model map
     local map, err = fetch_model_map(api_key)
     if not map then
-        -- If we have a stale cache, try it
-        if model_map then
-            local entry = model_map[model]
-            if entry then
-                return check_confidential(model, entry)
-            end
+        if model_map and model_map[model] then
+            log.warn("model list refresh failed (", err, "), using stale cache")
+            return check_confidential(model, model_map[model])
         end
         return nil, "failed to resolve model '" .. model .. "': " .. (err or "unknown")
     end
 
     model_map = map
-    model_map_expires = now + MODEL_MAP_TTL
-
-    local entry = map[model]
-    return check_confidential(model, entry)
+    model_map_expires = now + config.MODEL_MAP_TTL_S
+    return check_confidential(model, map[model])
 end
 
 --- Fetch instances and nonces for a chute
 local function fetch_instances(chute_id, api_key)
     local httpc = http.new()
-    httpc:set_timeout(30000)
+    httpc:set_timeout(config.DISCOVERY_TIMEOUT_MS)
 
-    local url = API_BASE .. "/e2e/instances/" .. chute_id
+    local url = config.API_BASE .. "/e2e/instances/" .. chute_id
+    local t0 = ngx.now()
     local res, err = httpc:request_uri(url, {
         method = "GET",
         headers = {
@@ -143,35 +127,39 @@ local function fetch_instances(chute_id, api_key)
         },
         ssl_verify = true,
     })
+    local rtt = ngx.now() - t0
+    metrics.observe("e2ee_discovery_seconds", nil, rtt)
 
     if not res then
+        metrics.inc("e2ee_nonce_refresh_total", { result = "error" })
         return nil, "instance discovery failed: " .. (err or "unknown")
     end
-
     if res.status ~= 200 then
-        return nil, "instance discovery returned " .. res.status .. ": " .. (res.body or "")
+        metrics.inc("e2ee_nonce_refresh_total", { result = "http_" .. res.status })
+        return nil, "instance discovery returned " .. res.status .. ": " .. (res.body or ""):sub(1, 300)
     end
 
     local data = cjson.decode(res.body)
-    if not data or not data.instances then
+    if not data or type(data.instances) ~= "table" then
+        metrics.inc("e2ee_nonce_refresh_total", { result = "invalid" })
         return nil, "invalid instance discovery response: " .. (res.body or ""):sub(1, 200)
     end
 
-    local nonce_ttl = data.nonce_expires_in or 55
+    local nonce_ttl = tonumber(data.nonce_expires_in) or 55
     local expires_at = ngx.now() + nonce_ttl
 
     local total_nonces = 0
     for _, inst in ipairs(data.instances) do
         if inst.nonces then
             total_nonces = total_nonces + #inst.nonces
-            ngx.log(ngx.INFO, "  instance=", inst.instance_id,
-                    " nonces=", #inst.nonces,
-                    " first_nonce_prefix=", inst.nonces[1] and inst.nonces[1]:sub(1, 8) or "nil",
-                    " pubkey_len=", inst.e2e_pubkey and #inst.e2e_pubkey or 0)
+            log.debug("  instance=", inst.instance_id,
+                      " nonces=", #inst.nonces,
+                      " pubkey_len=", inst.e2e_pubkey and #inst.e2e_pubkey or 0)
         end
     end
-    ngx.log(ngx.INFO, "fetched ", #data.instances, " instances with ",
-            total_nonces, " nonces (TTL=", nonce_ttl, "s) for chute ", chute_id)
+    log.info("fetched ", #data.instances, " instances with ", total_nonces,
+             " nonces (TTL=", nonce_ttl, "s, rtt=", string.format("%.3f", rtt), "s) for chute ", chute_id)
+    metrics.inc("e2ee_nonce_refresh_total", { result = "ok" })
 
     return {
         instances = data.instances,
@@ -179,63 +167,66 @@ local function fetch_instances(chute_id, api_key)
     }
 end
 
---- Take one nonce from the cache for a chute_id
-local function take_nonce(chute_id)
+--- Take one nonce from the cache for a chute_id, choosing the instance via the selector.
+local function take_nonce(chute_id, mode)
     local cached = nonce_cache[chute_id]
-    if not cached then return nil end
+    if not cached then
+        return nil
+    end
     if ngx.now() >= cached.expires_at then
         nonce_cache[chute_id] = nil
         return nil
     end
 
-    for _, inst in ipairs(cached.instances) do
-        if inst.nonces and #inst.nonces > 0 then
-            local nonce = table.remove(inst.nonces, 1)
-            ngx.log(ngx.INFO, "take_nonce: instance=", inst.instance_id,
-                    " nonce_prefix=", nonce:sub(1, 12),
-                    " remaining=", #inst.nonces)
-            return {
-                instance_id = inst.instance_id,
-                e2e_pubkey = inst.e2e_pubkey,
-            }, nonce
-        end
+    local inst, reason = selector.pick(cached.instances, chute_id, mode)
+    if not inst then
+        -- All nonces consumed
+        nonce_cache[chute_id] = nil
+        return nil
     end
 
-    -- All nonces consumed
-    nonce_cache[chute_id] = nil
-    return nil
+    local nonce = table.remove(inst.nonces, 1)
+    log.debug("take_nonce: instance=", inst.instance_id, " mode=", mode, " reason=", reason,
+              " nonce_prefix=", nonce:sub(1, 8), " remaining=", #inst.nonces)
+    return {
+        instance_id = inst.instance_id,
+        e2e_pubkey = inst.e2e_pubkey,
+    }, nonce, reason
 end
 
---- Invalidate cached nonces for a chute (force refresh on next get_nonce)
-function _M.invalidate_nonces(chute_id)
+--- Invalidate cached nonces for a chute; also drops the selector's affinity
+--- for the given instance (or the whole chute when instance_id is nil).
+function _M.invalidate_nonces(chute_id, instance_id)
     nonce_cache[chute_id] = nil
+    selector.invalidate(chute_id, instance_id)
 end
 
 --- Get an instance and nonce for a chute
--- @param chute_id  Chute UUID
--- @param api_key   API key
--- @return instance_info table {instance_id, e2e_pubkey}, nonce string
-function _M.get_nonce(chute_id, api_key)
-    -- Try cached first
-    local inst, nonce = take_nonce(chute_id)
+-- @return instance_info {instance_id, e2e_pubkey}, nonce, pick_reason  (or nil, nil, err)
+function _M.get_nonce(chute_id, api_key, mode)
+    local inst, nonce, reason = take_nonce(chute_id, mode)
     if inst then
-        return inst, nonce
+        return inst, nonce, reason
     end
 
-    -- Fetch fresh
     local cached, err = fetch_instances(chute_id, api_key)
     if not cached then
         return nil, nil, err
     end
-
     nonce_cache[chute_id] = cached
 
-    inst, nonce = take_nonce(chute_id)
+    inst, nonce, reason = take_nonce(chute_id, mode)
     if not inst then
         return nil, nil, "no nonces available for chute " .. chute_id
     end
+    return inst, nonce, reason
+end
 
-    return inst, nonce
+--- Tests only.
+function _M._reset()
+    model_map = nil
+    model_map_expires = 0
+    nonce_cache = {}
 end
 
 return _M

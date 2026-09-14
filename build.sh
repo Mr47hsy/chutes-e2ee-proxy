@@ -1,114 +1,57 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Build the e2ee-proxy Docker image.
 #
-# Usage:
-#   # With certs (embedded mode):
-#   ./build.sh \
-#     --cert /path/to/cert.pem \
-#     --intermediate /path/to/intermediate.pem \
-#     --root /path/to/root.pem \
-#     --key /path/to/privkey.pem \
-#     --xvmp /path/to/xvmp
+#   ./build.sh                       # Debian bookworm base (Dockerfile), linux/amd64, tag e2ee-proxy
+#   ./build.sh --alpine              # Alpine base (Dockerfile.alpine)
+#   ./build.sh --tag myrepo/e2ee-proxy:1.0
+#   ./build.sh --mlkem-backend kyber-r3   # only if end-to-end tests show the
+#                                         # instances speak Kyber round-3
 #
-#   # Without certs (must use TLS_SELF_SIGNED=true or TLS_CERT/TLS_KEY at runtime):
-#   ./build.sh --xvmp /path/to/xvmp
+# This is a thin wrapper around `docker build`; nothing outside this
+# repository is needed (no xvmp, no certificates).
 #
-# Or with env vars:
-#   CERT_PEM=... INT_PEM=... ROOT_PEM=... KEY_PEM=... XVMP_DIR=... ./build.sh
-#
-
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TAG="${TAG:-e2ee-proxy}"
+PLATFORM="${PLATFORM:-linux/amd64}"
+MLKEM_BACKEND="${MLKEM_BACKEND:-pqclean-ml-kem-768}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile}"
+EXTRA_ARGS=()
 
-# Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --cert)       CERT_PEM="$2"; shift 2 ;;
-        --intermediate|--int) INT_PEM="$2"; shift 2 ;;
-        --root)       ROOT_PEM="$2"; shift 2 ;;
-        --key)        KEY_PEM="$2"; shift 2 ;;
-        --xvmp)       XVMP_DIR="$2"; shift 2 ;;
-        --tag)        TAG="$2"; shift 2 ;;
+        --tag)            TAG="$2"; shift 2 ;;
+        --platform)       PLATFORM="$2"; shift 2 ;;
+        --mlkem-backend)  MLKEM_BACKEND="$2"; shift 2 ;;
+        --alpine)         DOCKERFILE="Dockerfile.alpine"; shift ;;
+        --debian)         DOCKERFILE="Dockerfile"; shift ;;   # kept for compatibility; Debian is the default
+        --dockerfile)     DOCKERFILE="$2"; shift 2 ;;
+        --no-cache)       EXTRA_ARGS+=("--no-cache"); shift ;;
+        --progress)       EXTRA_ARGS+=("--progress" "$2"); shift 2 ;;
+        -h|--help)        sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; exit 1 ;;
     esac
 done
 
-: "${XVMP_DIR:=$HOME/git/aegis/xvmp}"
-: "${TAG:=e2ee-proxy}"
-
-HAS_CERTS=true
-
-# Check if cert args were provided
-if [ -z "${CERT_PEM:-}" ] || [ -z "${INT_PEM:-}" ] || [ -z "${ROOT_PEM:-}" ] || [ -z "${KEY_PEM:-}" ]; then
-    HAS_CERTS=false
-fi
-
-# Verify cert files exist (if provided)
-if [ "$HAS_CERTS" = true ]; then
-    for f in "$CERT_PEM" "$INT_PEM" "$ROOT_PEM" "$KEY_PEM"; do
-        if [ ! -f "$f" ]; then
-            echo "ERROR: file not found: $f" >&2
-            exit 1
-        fi
-    done
-fi
-
-if [ ! -d "$XVMP_DIR/crypto" ] || [ ! -d "$XVMP_DIR/packer" ]; then
-    echo "ERROR: xvmp dir not valid: $XVMP_DIR" >&2
-    exit 1
-fi
-
-# Create temporary build context with everything Docker needs
-BUILD_CTX=$(mktemp -d)
-trap "rm -rf $BUILD_CTX" EXIT
-
-echo "=== Preparing build context in $BUILD_CTX ==="
-
-# Copy proxy sources
-cp -r "$SCRIPT_DIR/native" "$BUILD_CTX/native"
-cp -r "$SCRIPT_DIR/lua" "$BUILD_CTX/lua"
-cp -r "$SCRIPT_DIR/conf" "$BUILD_CTX/conf"
-cp "$SCRIPT_DIR/entrypoint.sh" "$BUILD_CTX/entrypoint.sh"
-cp "$SCRIPT_DIR/Dockerfile" "$BUILD_CTX/Dockerfile"
-
-# Copy xvmp sources (only what we need, not the full tree)
-mkdir -p "$BUILD_CTX/xvmp"
-cp -r "$XVMP_DIR/crypto" "$BUILD_CTX/xvmp/crypto"
-cp -r "$XVMP_DIR/packer" "$BUILD_CTX/xvmp/packer"
-cp -r "$XVMP_DIR/passes-modern" "$BUILD_CTX/xvmp/passes-modern"
-
-# Copy certs into build context (or create empty dir)
-mkdir -p "$BUILD_CTX/certs"
-if [ "$HAS_CERTS" = true ]; then
-    cp "$CERT_PEM" "$BUILD_CTX/certs/cert.pem"
-    cp "$INT_PEM" "$BUILD_CTX/certs/intermediate.pem"
-    cp "$ROOT_PEM" "$BUILD_CTX/certs/root.pem"
-    cp "$KEY_PEM" "$BUILD_CTX/certs/privkey.pem"
-else
-    echo ""
-    echo "WARNING: Building without embedded certs."
-    echo "  The embedded TLS mode will NOT work at runtime."
-    echo "  You must use one of:"
-    echo "    -e TLS_SELF_SIGNED=true                     (self-signed cert)"
-    echo "    -e TLS_CERT=/path/cert -e TLS_KEY=/path/key (custom cert)"
-    echo ""
-fi
-
-echo "=== Building Docker image: $TAG ==="
-
+echo "=== Building $TAG ($PLATFORM, $DOCKERFILE, MLKEM_BACKEND=$MLKEM_BACKEND) ==="
 docker build \
-    --platform linux/amd64 \
+    --platform "$PLATFORM" \
+    --build-arg "PLATFORM=$PLATFORM" \
+    --build-arg "MLKEM_BACKEND=$MLKEM_BACKEND" \
+    -f "$SCRIPT_DIR/$DOCKERFILE" \
     -t "$TAG" \
-    "$BUILD_CTX"
+    "${EXTRA_ARGS[@]}" \
+    "$SCRIPT_DIR"
 
-echo ""
-echo "=== Build complete: $TAG ==="
-echo ""
-echo "Run with:"
-if [ "$HAS_CERTS" = true ]; then
-    echo "  docker run -p 443:443 -p 80:80 $TAG"
-else
-    echo "  docker run -p 443:443 -p 80:80 -e TLS_SELF_SIGNED=true $TAG"
-fi
+cat <<EOF
+
+=== Build complete: $TAG ===
+
+Run (self-signed TLS, balanced routing, attestation enforced):
+  docker run --rm -p 8443:443 $TAG
+
+Then trust the certificate (printed at startup) and point clients at
+  https://localhost:8443/v1   or   https://e2ee-local-proxy.chutes.dev:8443/v1
+EOF

@@ -1,0 +1,15 @@
+_e2ee_init
+_e2ee_build_info
+_e2ee_get_cert_der
+_e2ee_get_intermediate_der
+_e2ee_get_root_der
+_e2ee_get_privkey_der
+_e2ee_mlkem_keygen
+_e2ee_mlkem_encapsulate
+_e2ee_mlkem_decapsulate
+_e2ee_hkdf_sha256
+_e2ee_chacha20_seal
+_e2ee_chacha20_open
+_e2ee_gzip_compress
+_e2ee_gzip_decompress
+_e2ee_random_bytes

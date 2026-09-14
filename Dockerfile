@@ -1,108 +1,72 @@
 # =============================================================================
-# E2EE Local Proxy - Multi-stage Docker Build
+# E2EE Local Proxy - default image: Debian bookworm (glibc). Two stages, no
+# external sources, no certificates.
 #
-# Do NOT call `docker build` directly - use build.sh which prepares
-# the build context with the required sources and cert files.
+#   docker build --platform linux/amd64 -t e2ee-proxy .      (or ./build.sh)
 #
-# Usage:
-#   ./build.sh \
-#     --cert /path/to/cert.pem \
-#     --intermediate /path/to/intermediate.pem \
-#     --root /path/to/root.pem \
-#     --key /path/to/privkey.pem \
-#     --xvmp /path/to/xvmp
+# Build args:
+#   MLKEM_BACKEND   pqclean-ml-kem-768 (default, FIPS 203) | kyber-r3
+#                   (see native/mlkem/README.md before changing this)
+#   OPENRESTY_TAG   runtime image tag
+#   PLATFORM        linux/amd64 by default (x86 is the deployment target);
+#                   ./build.sh --platform linux/arm64 for native Apple Silicon tests
 #
+# Why Debian: 109 MB vs 182 MB for the Alpine variant (the official Alpine
+# OpenResty image bundles gd/geoip/libxslt and its own OpenSSL), glibc, full
+# debugging tools. OpenResty publishes no Debian 13 (trixie) image; bookworm
+# is the newest Debian variant. Dockerfile.alpine is the musl alternative
+# (./build.sh --alpine).
 # =============================================================================
 
+ARG MLKEM_BACKEND=pqclean-ml-kem-768
+ARG OPENRESTY_TAG=1.31.1.1-bookworm
+ARG PLATFORM=linux/amd64
+
 # ---------------------------------------------------------------------------
-# Stage 1: Build LLVM Passes
+# Stage 1: native crypto library
 # ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 ubuntu:22.04 AS xvmp-passes
+FROM --platform=${PLATFORM} debian:bookworm-slim AS native-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build g++ git ca-certificates \
-    lsb-release wget software-properties-common gnupg \
+        gcc libc6-dev libssl-dev zlib1g-dev binutils bash \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 17 all
-
-ENV CC=clang-17
-ENV CXX=clang++-17
-
-COPY xvmp/passes-modern/ /xvmp/passes-modern/
-
-RUN mkdir -p /xvmp/build && cd /xvmp/build \
-    && cmake -G Ninja ../passes-modern \
-       -DCMAKE_BUILD_TYPE=Release \
-       -DLLVM_DIR=/usr/lib/llvm-17/lib/cmake/llvm \
-    && ninja -j$(nproc) \
-    && cp libxVMPPasses.so /opt/libxVMPPasses.so
-
-# ---------------------------------------------------------------------------
-# Stage 2: Build native .so with embedded certs
-# ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 ubuntu:22.04 AS native-builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    lsb-release wget software-properties-common gnupg \
-    libssl-dev zlib1g-dev openssl xxd binutils \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 17 all
-
-ENV PATH="/usr/lib/llvm-17/bin:$PATH"
-ENV PASSES=/opt/libxVMPPasses.so
-
-COPY --from=xvmp-passes /opt/libxVMPPasses.so /opt/libxVMPPasses.so
-
-# Copy crypto and packer sources
-COPY xvmp/crypto/ /xvmp/crypto/
-COPY xvmp/packer/ /xvmp/packer/
-
-# Copy proxy native sources
+ARG MLKEM_BACKEND
 COPY native/ /build/native/
-
-# Copy certs (prepared by build.sh - these stay in this stage only)
-COPY certs/ /tmp/certs/
-
-ENV XVMP_DIR=/xvmp
-ENV CERT_PEM=/tmp/certs/cert.pem
-ENV INT_PEM=/tmp/certs/intermediate.pem
-ENV ROOT_PEM=/tmp/certs/root.pem
-ENV KEY_PEM=/tmp/certs/privkey.pem
-ENV OUT_DIR=/out
-ENV CLANG=clang-17
-ENV OPT=opt-17
-
-RUN mkdir -p /out && cd /build/native && bash build_protected.sh
-
-# Purge all cert/key material from this stage
-RUN rm -rf /tmp/certs /build/native/embedded_certs.h
+RUN cd /build/native \
+    && CC=gcc OUT_DIR=/out MLKEM_BACKEND="$MLKEM_BACKEND" ./build.sh --selftest
 
 # ---------------------------------------------------------------------------
-# Stage 3: Runtime
+# Stage 2: runtime
 # ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 openresty/openresty:1.25.3.2-0-jammy
+FROM --platform=${PLATFORM} openresty/openresty:${OPENRESTY_TAG}
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN opm get ledgetech/lua-resty-http
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates openssl libssl3 zlib1g curl libcap2-bin \
+    && rm -rf /var/lib/apt/lists/*
 
-# Native .so
 COPY --from=native-builder /out/libe2ee_proxy.so /usr/local/openresty/lib/libe2ee_proxy.so
+RUN ldd /usr/local/openresty/lib/libe2ee_proxy.so \
+    && ! ldd /usr/local/openresty/lib/libe2ee_proxy.so | grep -q "not found"
 
-# Lua modules
 COPY lua/ /usr/local/openresty/lua/
-
-# nginx config
-COPY conf/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf
-
-# Entrypoint (generates dummy cert for OpenResty bootstrap)
+COPY conf/nginx.conf.template conf/locations.inc.template /usr/local/openresty/nginx/conf/
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh \
+    && groupadd --system e2ee \
+    && useradd --system --gid e2ee --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin e2ee \
+    && setcap 'cap_net_bind_service=+ep' /usr/local/openresty/nginx/sbin/nginx \
+    && mkdir -p /usr/local/openresty/nginx/logs \
+    && chown -R e2ee:e2ee /usr/local/openresty/nginx/logs
+
+USER e2ee
+
+RUN /entrypoint.sh --check
 
 EXPOSE 443 80
 
-# Verify .so links correctly
-RUN ldconfig && ldd /usr/local/openresty/lib/libe2ee_proxy.so || true
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsk https://127.0.0.1/health >/dev/null || exit 1
 
 CMD ["/entrypoint.sh"]

@@ -1,211 +1,383 @@
-# E2EE Local Proxy
+# E2EE Local Proxy (independent fork)
 
-An OpenResty-based reverse proxy that provides **end-to-end encryption** for the Chutes AI API. It transparently intercepts OpenAI-compatible requests, encrypts them with post-quantum cryptography (ML-KEM-768 + ChaCha20-Poly1305), and forwards them to GPU instances — only the model instance can decrypt the payload.
+An OpenResty-based reverse proxy that provides **end-to-end encryption** for the
+Chutes AI API. It speaks the OpenAI Chat Completions, Claude Messages and OpenAI
+Responses APIs locally, encrypts each request with post-quantum cryptography
+(ML-KEM-768 + HKDF-SHA256 + ChaCha20-Poly1305) and forwards it to the GPU
+instance, which is the only party able to decrypt it.
+
+This is a fork of [chutesai/e2ee-proxy](https://github.com/chutesai/e2ee-proxy)
+that can be **built from a clean clone**. The upstream image depends on a
+private obfuscation toolchain and an embedded TLS certificate; this fork
+replaces both with an open native library and standard TLS, and adds:
+
+| Area | Change |
+|---|---|
+| Build | `docker build .` works with nothing but this repository; native crypto is plain C on OpenSSL + zlib + vendored PQClean ML-KEM-768, with NIST/RFC self-tests as a build gate |
+| Image | `openresty/openresty:1.31.1.1-bookworm` base, 109 MB final image instead of ~500 MB on the upstream jammy base; an Alpine variant (`Dockerfile.alpine`, 182 MB) is one flag away |
+| Routing | Instance selection modes `agent` / `balanced` / `performance` / `default`, per-request `X-Route-Mode` header, automatic failover |
+| Security | TEE attestation of instance keys (observe/enforce), CORS allowlist, no API-key fragments in logs, unprivileged container user, HKDF/AEAD/gzip via OpenSSL |
+| Operations | `/metrics` (Prometheus), `X-Request-Id`, structured 413, 64 MB bodies, 15-minute read timeout, health check |
+| Hardening | Optional plaintext HTTP listener for local tooling, with explicit opt-in |
 
 ## Architecture
 
 ```
-Client (OpenAI SDK / Anthropic SDK)
+Client (OpenAI SDK / Anthropic SDK / curl)
     │
-    ▼  HTTPS (TLS)
+    ▼  HTTPS (self-signed or your cert)      [or plain HTTP on :80 if ALLOW_PLAINTEXT=true]
 ┌──────────────┐
-│  E2EE Proxy  │  ← You are here
+│  E2EE Proxy  │  instance selection · attestation · encryption · SSE decryption
 │  (OpenResty) │
 └──────┬───────┘
-       │  HTTPS + E2EE envelope
+       │  HTTPS + E2EE envelope (api.chutes.ai only sees ciphertext + routing headers)
        ▼
-  api.chutes.ai
-       │
-       ▼
-  GPU Instance (decrypts with instance private key)
+  api.chutes.ai ──▶ GPU instance in a TDX enclave (decrypts with its private key)
 ```
 
-The proxy runs locally (or in your infrastructure) and speaks the standard OpenAI API, the Claude Messages API, and the OpenAI Responses API. Clients point at `https://e2ee-local-proxy.chutes.dev:8443` instead of `api.chutes.ai`. The proxy handles format translation, key exchange, encryption, nonce management, and streaming decryption transparently.
-
-## Quick Start
+## Quick start
 
 ```bash
-docker run -p 8443:443 parachutes/e2ee-proxy:latest
+# build (linux/amd64 by default, Debian bookworm base)
+./build.sh                      # -> image e2ee-proxy
+./build.sh --alpine             # same layout on Alpine (musl)
+
+# run: self-signed TLS, balanced routing, attestation enforced
+docker run --rm -p 8443:443 e2ee-proxy
 ```
 
-The embedded TLS certificate is valid for `e2ee-local-proxy.chutes.dev`, which resolves to `127.0.0.1`. Use this hostname to avoid certificate errors:
+The container prints how to trust its self-signed certificate. The certificate
+covers `localhost`, `127.0.0.1`, `::1` and `e2ee-local-proxy.chutes.dev` (a
+public DNS name that resolves to `127.0.0.1`), so either host name works:
 
 ```python
-# OpenAI SDK
 from openai import OpenAI
-client = OpenAI(
-    api_key="cpk_...",
-    base_url="https://e2ee-local-proxy.chutes.dev:8443/v1",
-)
+client = OpenAI(api_key="cpk_...", base_url="https://localhost:8443/v1")
 resp = client.chat.completions.create(
-    model="deepseek-ai/DeepSeek-V3.1-TEE",
+    model="Qwen/Qwen3-32B-TEE",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 
-# Anthropic SDK
 import anthropic
-client = anthropic.Anthropic(
-    api_key="cpk_...",
-    base_url="https://e2ee-local-proxy.chutes.dev:8443",
-)
-resp = client.messages.create(
-    model="deepseek-ai/DeepSeek-V3.1-TEE",
-    max_tokens=128,
-    messages=[{"role": "user", "content": "Hello!"}],
-)
-
-# OpenAI Responses API
-client = OpenAI(
-    api_key="cpk_...",
-    base_url="https://e2ee-local-proxy.chutes.dev:8443/v1",
-)
-resp = client.responses.create(
-    model="deepseek-ai/DeepSeek-V3.1-TEE",
-    input="Hello!",
-)
+client = anthropic.Anthropic(api_key="cpk_...", base_url="https://localhost:8443")
+resp = client.messages.create(model="Qwen/Qwen3-32B-TEE", max_tokens=128,
+                              messages=[{"role": "user", "content": "Hello!"}])
 ```
 
-## Why the TLS Cert Is Protected
-
-The default deployment embeds a TLS certificate and private key directly inside a **protected shared library** (`libe2ee_proxy.so`). This is necessary because:
-
-1. **Certificate Transparency (CT) monitors** like CertSpotter continuously scan for newly-issued certificates and cross-reference them against public key material found in container images, GitHub repos, and package registries.
-2. If the private key is stored as a plaintext file (even temporarily during a Docker build), automated scanners **will detect it, flag it, and the CA will revoke the certificate** — often within hours.
-3. By embedding the cert material into a compiled and obfuscated shared library, the key material is not recognizable to scanners.
-
-## TLS Modes
-
-The proxy supports three TLS certificate modes, selected via environment variables at container startup.
-
-### 1. Embedded (Default)
-
-Certs are loaded at runtime from the protected `.so`. No files on disk. This is the production mode.
+To keep the same certificate across container restarts mount a state directory:
 
 ```bash
-docker run -p 8443:443 parachutes/e2ee-proxy:latest
+docker run --rm -p 8443:443 -v e2ee-tls:/tls -e TLS_STATE_DIR=/tls e2ee-proxy
 ```
 
-### 2. Self-Signed (Local Development)
+## Verifying the ML-KEM variant (do this once after building)
 
-Generates a certificate at startup. Useful for local development and testing.
+Kyber round-3 and FIPS 203 ML-KEM have identical key/ciphertext sizes but do
+**not** interoperate. This fork ships FIPS 203 (PQClean `ml-kem-768/clean`);
+the build's self-test proves the implementation against NIST ACVP vectors, and
+the evidence that Chutes speaks FIPS 203 is laid out in
+[`native/mlkem_backend.h`](native/mlkem_backend.h). The only conclusive proof
+is a real request:
 
 ```bash
-docker run -p 8443:443 \
-  -e TLS_SELF_SIGNED=true \
-  -e TLS_DOMAIN=myproxy.local \
-  parachutes/e2ee-proxy:latest
+curl -sk https://localhost:8443/v1/chat/completions \
+  -H "Authorization: Bearer cpk_..." -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-32B-TEE","messages":[{"role":"user","content":"ping"}]}'
 ```
 
-The container prints instructions for trusting the cert. To extract it:
+- A normal completion: the variant is right, done.
+- HTTP 400/500 from upstream with everything else healthy (`/health` ok,
+  `/v1/models` lists the model, `/e2e/instances` succeeded in the logs): the
+  instances likely speak Kyber round-3. Rebuild with
+  `./build.sh --mlkem-backend kyber-r3` after vendoring the round-3 sources as
+  described in [`native/mlkem/README.md`](native/mlkem/README.md).
+
+Then run a streaming request as well (`"stream": true`); it exercises the
+separate `e2e-stream-v1` key derivation. `tests/e2e_real.sh` does all of the
+above (health, model listing, non-streaming, streaming, metrics) and reads the
+key from `CHUTES_API_KEY` without echoing it:
 
 ```bash
-docker cp $(docker ps -qf ancestor=parachutes/e2ee-proxy):/tmp/ssl.crt ./ssl.crt
-
-# macOS
-sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain ssl.crt
-
-# Linux (Debian/Ubuntu)
-sudo cp ssl.crt /usr/local/share/ca-certificates/e2ee-proxy.crt
-sudo update-ca-certificates
-
-# Windows (PowerShell as Admin)
-Import-Certificate -FilePath ssl.crt -CertStoreLocation Cert:\LocalMachine\Root
+docker run -d --name e2ee-proxy -p 8443:443 e2ee-proxy
+CHUTES_API_KEY=cpk_... tests/e2e_real.sh            # MODEL=... to pick another TEE model
 ```
 
-`TLS_DOMAIN` defaults to `localhost` if not set.
+## TLS
 
-### 3. Custom Certificate
+| Mode | How | Notes |
+|---|---|---|
+| Self-signed (default) | nothing to set | SAN includes `TLS_DOMAIN`, `localhost`, loopback IPs, `e2ee-local-proxy.chutes.dev`; set `TLS_STATE_DIR` to persist |
+| Custom certificate | `TLS_CERT`, `TLS_KEY`, optional `TLS_CA` (PEM paths) | recommended for anything beyond a local loopback deployment |
 
-Bring your own cert and key files via volume mounts.
+`TLS_DOMAIN` sets `server_name` and the self-signed CN (default `localhost`).
+The upstream "embedded certificate" mode is gone: no private key ships inside
+the image, so there is nothing for Certificate Transparency monitors to
+revoke and no key shared between all users.
 
-```bash
-docker run -p 8443:443 \
-  -v /path/to/cert.pem:/certs/cert.pem:ro \
-  -v /path/to/key.pem:/certs/key.pem:ro \
-  -v /path/to/ca.pem:/certs/ca.pem:ro \
-  -e TLS_CERT=/certs/cert.pem \
-  -e TLS_KEY=/certs/key.pem \
-  -e TLS_CA=/certs/ca.pem \
-  -e TLS_DOMAIN=mydomain.com \
-  parachutes/e2ee-proxy:latest
+## Routing modes
+
+`/e2e/instances/{chute_id}` returns several GPU instances, each with a batch of
+single-use nonces valid for about 55 s. Upstream always used the first
+instance with nonces left, so requests spaced more than 55 s apart hopped
+between instances and lost the prefix KV cache (measured on a 20k-token
+prefix: hit rate 43%, effective input price $1.999/M; sticky: 100%, $0.330/M).
+
+| Mode | Strategy | Use for |
+|---|---|---|
+| `agent` | one sticky instance per model | a single interactive coding agent |
+| `balanced` (default) | sticky set of `BALANCED_N` (3) instances, round-robin | several agents in parallel; every member stays warm |
+| `performance` | power-of-two-choices on a decaying EWMA of time-to-first-token | batch jobs that do not benefit from cache |
+| `default` | upstream behaviour | control group / comparison |
+
+- `ROUTE_MODE` sets the global default; the request header `X-Route-Mode:
+  agent|balanced|performance|default` overrides it per request (unknown
+  values fall back to the default with a warning).
+- Every response carries `X-E2EE-Instance-Id` and `X-E2EE-Route-Mode`.
+- Failover is automatic: a nonce rejection (403) is retried once on another
+  instance; an instance that returns 5xx, fails to connect or fails
+  attestation is dropped from stickiness and avoided for `ROUTE_BAN_S` (60 s).
+- `PIN_INSTANCE_ID=<id>` pins one instance for experiments. It falls back to
+  the mode logic when that instance is absent, with a warning; there is no
+  other recovery, do not use it in production.
+
+Hedged requests (racing two instances) are intentionally not implemented:
+they double billing.
+
+## Attestation
+
+Upstream encrypted to whatever public key the discovery endpoint returned.
+Nothing checked that the key was generated inside a genuine TD, so a
+compromised discovery service could substitute its own key and read every
+prompt while all client-side checks still passed.
+
+This fork fetches a TDX quote for each instance key and verifies:
+
+1. `report_data[0:32] == SHA256(nonce ‖ e2e_pubkey)` with a fresh 32-byte
+   client nonce (defeats key substitution and quote replay by itself),
+2. the TD debug bit is clear,
+3. `MRTD` / `RTMR0-3` match `E2EE_ATTEST_MRTD` / `E2EE_ATTEST_RTMR*` when set,
+4. the quote header is a well-formed TDX quote (v4/v5, ECDSA-P256, tee 0x81).
+
+**Not verified: the quote's ECDSA signature and the PCK certificate chain.**
+That needs Intel DCAP QVL, which is not in the image. Consequence: an attacker
+who controls the API *and* can forge quotes still wins; one who can only swap
+the public key does not. Pinning measurements obtained from an out-of-band
+DCAP verification closes most of the remaining gap.
+
+Confirmed against the live API (2026-09-14): the evidence endpoint is
+`GET /chutes/{chute_id}/evidence?nonce=<32 bytes hex>` and returns
+
+```
+{ "evidence": [ { "instance_id": "...", "quote": "<base64 TDX quote v4>",
+                  "certificate": "...", "signature": "...", "attested_body": "...",
+                  "gpu_evidence": [ { "arch": "BLACKWELL", "certificate": "...", "evidence": "..." } ] } ],
+  "failed_instance_ids": [] }
 ```
 
-`TLS_CA` is optional — if provided, it's appended to the cert chain.
+with `report_data[0:32] = SHA256(nonce_hex ‖ e2e_pubkey_base64)`. The entry
+whose `instance_id` matches the chosen instance is used (falling back to any
+quote in the document that binds our nonce to that key). Not verified today,
+in addition to the quote signature and PCK chain: the per-entry
+`signature`/`certificate` over `attested_body`, and the NVIDIA GPU evidence.
+Both are candidates for a follow-up once their formats are documented.
 
-### Environment Variable Reference
+- `E2EE_ATTEST=enforce` (default): instances that fail are rejected (up to
+  three are tried per request) and the request returns
+  `502 TEE attestation failed`. Verifications are cached per instance key
+  for `E2EE_ATTEST_TTL` (600 s).
+- `E2EE_ATTEST=observe`: runs every check, logs `attestation OK …` or
+  `ATTESTATION FAILED (observe mode, request allowed)` with the response
+  shape, never rejects; failures are cached for `E2EE_ATTEST_FAIL_TTL`
+  (300 s). Use it when investigating a schema change.
+- `E2EE_ATTEST_URLS` overrides the endpoint candidates (templates with
+  `{api}`, `{chute_id}`, `{instance_id}`, `{nonce_hex}`); the quote is
+  located structurally so field names do not matter, and several
+  nonce/pubkey encodings are tried for the binding (a match proves the quote
+  was made for this nonce and key, so trying several does not weaken it).
+- `E2EE_ATTEST=off` disables it.
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TLS_CERT` | Path to PEM certificate file | *(none)* |
-| `TLS_KEY` | Path to PEM private key file | *(none)* |
-| `TLS_CA` | Path to PEM CA chain file (optional) | *(none)* |
-| `TLS_SELF_SIGNED` | Set to `true` to generate a self-signed cert | `false` |
-| `TLS_DOMAIN` | Domain for server_name and self-signed cert SAN | `localhost` (self-signed) / `_` (catch-all) |
-| `ALLOW_NON_CONFIDENTIAL` | Set to `true` to allow non-TEE models | `false` |
+Also note that `confidential_compute` in `/v1/models` is self-reported by the
+API; attestation is what actually ties the key to a TD.
 
-### Mode Priority
+## Plaintext HTTP, CORS and what is (not) encrypted
 
-If multiple variables are set, the first match wins:
+- Port 80 redirects to HTTPS by default. `ALLOW_PLAINTEXT=true` makes it serve
+  the API without TLS, for local tools that cannot trust a self-signed
+  certificate. API keys then cross that hop in cleartext, so publish it on
+  loopback only: `docker run -p 127.0.0.1:8080:80 …`. (Inside a container the
+  listener must bind all interfaces for `-p` to work; `PLAINTEXT_BIND_ADDR`
+  overrides that for `--network host` deployments.)
+- CORS is an allowlist. Default: `null`, `http(s)://localhost[:port]`,
+  `http(s)://127.0.0.1[:port]`, `http(s)://[::1][:port]`,
+  `https://e2ee-local-proxy.chutes.dev[:port]`. Override with
+  `CORS_ALLOWED_ORIGINS=https://app.example.com,https://*.example.org`
+  (`*` alone restores allow-any).
+- `GET /v1/models` is a TLS passthrough to `llm.chutes.ai`; it is **not**
+  end-to-end encrypted (the model list is public metadata, the Authorization
+  header is forwarded).
+- Routing metadata is visible to api.chutes.ai in cleartext headers:
+  chute id, instance id, nonce, stream flag, path, and your API key. Only the
+  request/response bodies are end-to-end encrypted.
 
-1. `TLS_CERT` + `TLS_KEY` → custom mode
-2. `TLS_SELF_SIGNED=true` → self-signed mode
-3. Neither → embedded mode
+## Configuration
 
-## Confidential Compute Requirement
+| Variable | Default | Description |
+|---|---|---|
+| `TLS_CERT`, `TLS_KEY`, `TLS_CA` | – | PEM paths for a custom certificate (CA appended to the chain) |
+| `TLS_DOMAIN` | `localhost` | server_name and self-signed CN/SAN |
+| `TLS_STATE_DIR` | – | directory to persist the self-signed certificate |
+| `ROUTE_MODE` | `balanced` | `agent`, `balanced`, `performance`, `default` |
+| `BALANCED_N` | `3` | size of the sticky set in balanced mode |
+| `ROUTE_BAN_S` | `60` | seconds an instance is avoided after a failure |
+| `PIN_INSTANCE_ID` | – | diagnostics: force one instance |
+| `PERF_EWMA_ALPHA`, `PERF_HALF_LIFE_S`, `PERF_COLD_START_S` | `0.3`, `300`, `0.5` | performance-mode scoring |
+| `E2EE_ATTEST` | `enforce` | `enforce`, `observe`, `off` |
+| `E2EE_ATTEST_MRTD`, `E2EE_ATTEST_RTMR0..3` | – | hex allowlist (empty = accept any) |
+| `E2EE_ATTEST_TTL` / `E2EE_ATTEST_FAIL_TTL` | `600` / `300` | cache of successful / observed-failed verifications (s) |
+| `E2EE_ATTEST_URLS` | built-in candidates | endpoint templates |
+| `E2EE_ATTEST_ALLOW_DEBUG_TD` | `false` | accept debug-mode TDs (do not) |
+| `ALLOW_NON_CONFIDENTIAL` | `false` | allow models without `confidential_compute` |
+| `ALLOW_PLAINTEXT` | `false` | serve the API on port 80 without TLS |
+| `PLAINTEXT_BIND_ADDR` | `0.0.0.0` | bind address of the plaintext listener |
+| `CORS_ALLOWED_ORIGINS` | local origins | comma-separated allowlist, `*` wildcards |
+| `MAX_BODY_SIZE` | `64m` | `client_max_body_size`; larger bodies get a JSON 413 |
+| `UPSTREAM_READ_TIMEOUT_MS` | `900000` | read timeout towards api.chutes.ai (long generations) |
+| `UPSTREAM_CONNECT_TIMEOUT_MS`, `UPSTREAM_SEND_TIMEOUT_MS` | `5000`, `30000` | |
+| `DISCOVERY_TIMEOUT_MS`, `MODELS_TIMEOUT_MS`, `MODEL_MAP_TTL_S` | `30000`, `10000`, `300` | |
+| `LOG_LEVEL` | `notice` | nginx error log level; `debug` adds per-request traces (nonce prefixes only) |
+| `METRICS_ENABLED` | `true` | expose `/metrics` |
+| `API_BASE`, `MODELS_BASE` | `https://api.chutes.ai`, `https://llm.chutes.ai` | upstream endpoints (integration tests point them at a mock) |
 
-By default, the proxy **rejects requests to models not running in a Trusted Execution Environment (TEE)**. E2EE only guarantees privacy when the GPU instance runs inside confidential compute — otherwise an operator could theoretically dump memory and read decrypted payloads.
+## Observability
 
-Models with `confidential_compute: true` in `/v1/models` (typically suffixed with `-TEE`) are allowed. Non-confidential models return an error:
+- `GET /health` → status, route mode, attestation mode, native build info
+  (ML-KEM backend, OpenSSL version).
+- `GET /metrics` (Prometheus text): request counts by path/mode/outcome,
+  upstream error classes (`nonce_403`, `5xx`, `timeout`, `connect`, `decrypt`,
+  `attest`), TTFT histogram by mode, seal/open durations, prompt and cached
+  token totals from upstream `usage` (cache hit rate = cached / prompt),
+  instance picks by reason, affinity hits/misses by mode, per-instance TTFT
+  EWMA, nonce refreshes and `/e2e/instances` round-trip time, attestation
+  results, keepalive reuse.
+- `X-Request-Id`: taken from the client header when present (sanitised),
+  otherwise generated; echoed on the response and prefixed on every log line
+  and the access log.
+- Logs never contain API keys or full nonces. `LOG_LEVEL=debug` adds instance
+  choices and 8-character nonce prefixes.
 
-```
-model 'Qwen/Qwen3-32B' is not running in confidential compute (TEE).
-E2EE requires confidential compute to guarantee privacy.
-Set ALLOW_NON_CONFIDENTIAL=true to override.
-```
+## API endpoints
 
-To bypass this check (e.g. for testing):
-
-```bash
-docker run -p 8443:443 -e ALLOW_NON_CONFIDENTIAL=true parachutes/e2ee-proxy:latest
-```
-
-## API Endpoints
-
-The proxy exposes multiple API formats — requests to `/v1/messages` and `/v1/responses` are translated to chat completions before encryption:
-
-| Endpoint | Behavior |
-|----------|----------|
-| `GET /health` | Returns `{"status":"ok"}` |
-| `GET /v1/models` | Passthrough to `llm.chutes.ai` (no E2EE) |
-| `POST /v1/chat/completions` | E2EE encrypted |
-| `POST /v1/messages` | E2EE encrypted (Claude Messages API format, translated to chat completions) |
-| `POST /v1/responses` | E2EE encrypted (OpenAI Responses API format, translated to chat completions) |
-| `POST /v1/completions` | E2EE encrypted |
-| `POST /v1/*` | E2EE encrypted (any v1 path) |
+| Endpoint | Behaviour |
+|---|---|
+| `GET /health` | proxy status |
+| `GET /metrics` | Prometheus metrics |
+| `GET /v1/models` | passthrough to `llm.chutes.ai` (TLS only, no E2EE) |
+| `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/*` | E2EE |
+| `POST /v1/messages` | E2EE, Claude Messages API translated to chat completions |
+| `POST /v1/responses` | E2EE, OpenAI Responses API translated to chat completions |
 | `OPTIONS *` | CORS preflight (204) |
 
-All other paths return 404.
+## E2EE protocol
 
-## E2EE Protocol
+For each request the proxy:
 
-For each request, the proxy:
+1. resolves the model to a chute id via `/v1/models` (cached 5 min),
+2. takes an instance + single-use nonce from `/e2e/instances/{chute_id}`
+   (instance chosen by the routing mode),
+3. verifies the instance key's TDX attestation (cached 10 min per key),
+4. generates an ephemeral ML-KEM-768 keypair for the response,
+5. encapsulates to the instance key and derives the request key with
+   HKDF-SHA256 (salt = first 16 bytes of the ML-KEM ciphertext, info
+   `e2e-req-v1`),
+6. injects the response public key into the JSON, gzips it, seals it with
+   ChaCha20-Poly1305 (12-byte random nonce, 16-byte tag, no AAD),
+7. POSTs `mlkem_ct ‖ nonce ‖ ciphertext ‖ tag` to `/e2e/invoke` over a
+   keep-alive TLS connection,
+8. decrypts the response blob (info `e2e-resp-v1`) or, for streaming, derives
+   the stream key from the `e2e_init` event (info `e2e-stream-v1`) and
+   decrypts each `base64(nonce ‖ ciphertext ‖ tag)` chunk.
 
-1. **Resolves** the model name to a chute ID via `/v1/models`
-2. **Fetches** an available GPU instance and single-use nonce from `api.chutes.ai`
-3. **Generates** an ephemeral ML-KEM-768 keypair
-4. **Encapsulates** a shared secret using the instance's public key
-5. **Derives** symmetric keys via HKDF-SHA256
-6. **Compresses** the request body with gzip
-7. **Encrypts** with ChaCha20-Poly1305
-8. **Sends** the encrypted blob to `api.chutes.ai/e2e/invoke`
-9. **Decrypts** the response (or streaming SSE chunks) and returns plaintext to the client
+Every request uses a fresh ephemeral keypair (forward secrecy).
 
-| Primitive | Purpose |
-|-----------|---------|
-| ML-KEM-768 | Post-quantum key encapsulation (NIST standardized) |
-| HKDF-SHA256 | Key derivation from shared secret |
-| ChaCha20-Poly1305 | Authenticated encryption (AEAD) |
-| Gzip | Payload compression before encryption |
+## Development
 
-Every request uses a fresh ephemeral keypair — forward secrecy is guaranteed.
+```
+native/           C library: e2ee_proxy_api.c (OpenSSL HKDF/AEAD, zlib gzip,
+                  getrandom), mlkem/ (vendored PQClean FIPS 203 ML-KEM-768),
+                  selftest.c + selftest_kat.h (NIST ACVP, RFC 5869, RFC 8439,
+                  Wycheproof vectors), build.sh
+lua/              OpenResty modules; lua/resty/ is vendored lua-resty-http 0.17.2
+conf/             nginx.conf.template + locations.inc.template (rendered by entrypoint.sh)
+tests/unit/       pure-Lua tests with an ngx mock (run: tests/unit/run.sh)
+tests/integration mock_upstream.py (independent Python implementation of the
+                  server side, kyber-py + cryptography) and pytest suite
+```
+
+Local checks without Docker:
+
+```bash
+cd native && ./build.sh --selftest         # needs a C compiler, OpenSSL headers, zlib
+tests/unit/run.sh                          # needs luajit
+```
+
+Integration tests need the built image and a Python environment; the runner
+starts the mock upstream and three proxy containers (observe / enforce /
+1 MB body limit), runs pytest and scans the proxy logs for key material:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r tests/integration/requirements.txt
+PYTHON=.venv/bin/python tests/integration/run_local.sh        # add --keep to leave containers up
+```
+
+The containers reach the mock through `host.docker.internal` on Docker
+Desktop and through the bridge gateway IP on Linux (`MOCK_HOST` overrides):
+OpenResty cosockets resolve names via nginx's DNS resolver only, never
+`/etc/hosts`, so `--add-host` entries are invisible to the proxy's Lua code.
+
+CI (`.github/workflows/ci.yml`) runs LuaJIT syntax checks, luacheck, unit
+tests, the native self-test, builds the amd64 image, runs the in-image cjson
+round-trip test, and drives three proxy containers (observe, enforce, small
+body limit) against the mock upstream, then asserts that no API key material
+appears in the logs.
+
+### Image notes
+
+- The image targets `linux/amd64` by default (both Dockerfiles carry
+  `ARG PLATFORM=linux/amd64`, so a bare `docker build .` is x86 too). On an
+  Apple Silicon Mac the builder stage runs under Rosetta/QEMU and still
+  produces an x86_64 `.so`; `./build.sh --platform linux/arm64` builds a
+  native image for local testing.
+- Default base is Debian bookworm (glibc): the native library is compiled in
+  a `debian:bookworm-slim` stage and runs on
+  `openresty/openresty:1.31.1.1-bookworm`. Inside nginx the loader reuses
+  the `libcrypto.so.3` OpenResty bundles, so no version pin is needed beyond
+  the OpenSSL 3 soname.
+- `Dockerfile.alpine` is the same layout on `alpine:3.23` +
+  `openresty/openresty:1.31.1.1-alpine` (musl). It ends up larger (182 MB vs
+  109 MB) because the official Alpine OpenResty image bundles gd/geoip/libxslt
+  and its own OpenSSL; use it only if you standardise on Alpine.
+- Runs as an unprivileged user; port binding uses `cap_net_bind_service` on
+  the nginx binary.
+- `worker_processes 1` is deliberate: nonce batches, routing state, metrics
+  and attestation caches live in module-level Lua tables. Moving to several
+  workers needs those in `lua_shared_dict` with atomic operations (nonces are
+  single-use).
+- Switching the ML-KEM backend: `MLKEM_BACKEND=kyber-r3` build arg, see
+  [`native/mlkem/README.md`](native/mlkem/README.md).
+
+## Known limitations / follow-ups
+
+- Attestation: the TDX quote signature and PCK chain, the per-entry
+  `signature`/`certificate`, and the GPU evidence are not verified (a DCAP
+  QVL / NVIDIA NRAS sidecar or an in-`.so` verifier would close this).
+- Nonce batches are fetched synchronously when they expire (about one extra
+  round trip when requests are more than ~55 s apart); background prefetch
+  is a possible follow-up.
+- Single worker by design (see above).
+- OpenResty publishes no Debian 13 (trixie) image; bookworm is the newest
+  Debian base. An `alpine-slim` OpenResty tag exists but was not evaluated.
+
+## License
+
+MIT (see `LICENSE`). Vendored components: PQClean (public domain / CC0),
+lua-resty-http (BSD-2-Clause, `lua/resty/LICENSE-lua-resty-http`).
