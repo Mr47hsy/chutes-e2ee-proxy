@@ -44,9 +44,20 @@ for _ in $(seq 1 30); do
 done
 curl -sf "http://127.0.0.1:$MOCK_PORT/_mock/stats" >/dev/null || { echo "mock did not start"; cat "$LOG_DIR/mock.log"; exit 1; }
 
-COMMON=(--add-host=host.docker.internal:host-gateway
-        -e "API_BASE=http://host.docker.internal:$MOCK_PORT"
-        -e "MODELS_BASE=http://host.docker.internal:$MOCK_PORT"
+# How the containers reach the mock on the host. OpenResty cosockets resolve
+# names through nginx's DNS resolver only (not /etc/hosts): Docker Desktop's
+# embedded DNS knows host.docker.internal, plain Linux Docker does not, so use
+# the bridge gateway IP there. Override with MOCK_HOST=... if needed.
+if [ -z "${MOCK_HOST:-}" ]; then
+    if [ "$(uname -s)" = "Linux" ]; then
+        MOCK_HOST=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo 172.17.0.1)
+    else
+        MOCK_HOST=host.docker.internal
+    fi
+fi
+echo "containers will reach the mock at http://$MOCK_HOST:$MOCK_PORT"
+COMMON=(-e "API_BASE=http://$MOCK_HOST:$MOCK_PORT"
+        -e "MODELS_BASE=http://$MOCK_HOST:$MOCK_PORT"
         -e LOG_LEVEL=info)
 
 echo "=== proxies ($IMAGE) ==="

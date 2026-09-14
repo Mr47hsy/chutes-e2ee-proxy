@@ -75,9 +75,14 @@ jobs:
 
       - name: Start proxies (observe / enforce / small-body)
         run: |
-          COMMON="--add-host=host.docker.internal:host-gateway \
-                  -e API_BASE=http://host.docker.internal:9100 \
-                  -e MODELS_BASE=http://host.docker.internal:9100 \
+          # OpenResty cosockets resolve hosts through nginx's DNS resolver only
+          # (never /etc/hosts), so host.docker.internal is unusable on Linux.
+          # Reach the mock on the host through the bridge gateway IP instead.
+          HOST_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+          echo "mock upstream reachable from containers at $HOST_IP:9100"
+          curl -sf "http://$HOST_IP:9100/_mock/stats" >/dev/null || echo "::warning::mock not reachable via $HOST_IP from the host (may still work from containers)"
+          COMMON="-e API_BASE=http://$HOST_IP:9100 \
+                  -e MODELS_BASE=http://$HOST_IP:9100 \
                   -e LOG_LEVEL=info"
           docker run -d --name proxy-observe -p 8443:443 $COMMON -e E2EE_ATTEST=observe e2ee-proxy:ci
           docker run -d --name proxy-enforce -p 8444:443 $COMMON \

@@ -329,6 +329,11 @@ python3 -m venv .venv && .venv/bin/pip install -r tests/integration/requirements
 PYTHON=.venv/bin/python tests/integration/run_local.sh        # add --keep to leave containers up
 ```
 
+The containers reach the mock through `host.docker.internal` on Docker
+Desktop and through the bridge gateway IP on Linux (`MOCK_HOST` overrides):
+OpenResty cosockets resolve names via nginx's DNS resolver only, never
+`/etc/hosts`, so `--add-host` entries are invisible to the proxy's Lua code.
+
 CI (`.github/workflows/ci.yml`) runs LuaJIT syntax checks, luacheck, unit
 tests, the native self-test, builds the amd64 image, runs the in-image cjson
 round-trip test, and drives three proxy containers (observe, enforce, small
